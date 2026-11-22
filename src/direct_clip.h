@@ -47,6 +47,7 @@ private:
     std::string profile_url_;
     std::string profile_media_;
     std::string requested_source_;
+    std::string fallback_source_;
     std::vector<uint8_t> audio_config_;
     std::thread worker_;
     AVFormatContext *input_ = nullptr;

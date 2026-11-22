@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.7]
+
+- Retry empty or prematurely ended Safari streams and distinguish them from normal completion.
+- Fall back to the original HLS source when a profiled MP4 produces no video.
+
 ## [0.3.6]
 
 - Resume Safari playback from a short buffer after transient network stalls.

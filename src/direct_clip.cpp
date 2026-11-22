@@ -102,6 +102,8 @@ bool DirectClip::play(const char *url, double start) {
     std::lock_guard<std::mutex> lock(requests_);
     authorized_clip_ = true;
     requested_source_ = source;
+    fallback_source_ = mapped && source != request && stream_kind(request) == StreamKind::Hls ?
+        request.substr(0, request.find('#')) : "";
     new_clip_ = true;
     reopen_input_ = false;
     requested_position_ = std::isfinite(start) && start >= 0 && start <= 36000 ? start : 0;
@@ -602,11 +604,21 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
     }
     if (finished_ && empty) {
         const int position = position_ms_;
-        if (failed_ && read_error_ && position > 0 &&
-            position + int64_t(500) < duration_ms_ && network_retries_ < 2) {
+        media.end_loading();
+        media.eos();
+        const bool no_picture = media.frames == 0;
+        // Some HTTP failures look like clean EOF to the demuxer.
+        constexpr int64_t end_tolerance_ms = 2000;
+        const bool ended_early = position >= 0 && position + end_tolerance_ms < duration_ms_;
+        if ((no_picture || ended_early || (failed_ && read_error_)) && network_retries_ < 2) {
             std::lock_guard<std::mutex> lock(requests_);
             if (authorized_clip_ && !start_requested_ && !stop_requested_) {
-                requested_position_ = position / 1000.0;
+                if (!fallback_source_.empty() && no_picture) {
+                    requested_source_ = std::move(fallback_source_);
+                    fallback_source_.clear();
+                    fprintf(stderr, "[direct] mapped MP4 had no video, trying original HLS\n");
+                }
+                if (!no_picture && position > 0) requested_position_ = position / 1000.0;
                 reopen_input_ = start_requested_ = true;
                 ++network_retries_;
                 fprintf(stderr, "[direct] reconnecting at %.2f s (attempt %u)\n",
@@ -614,16 +626,16 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
                 return true;
             }
         }
-        media.end_loading();
-        media.eos();
         fprintf(stderr, "[direct] done packets=%u frames=%u audio=%u\n",
                 feeds_.load(), media.frames.load(), audio_feeds_.load());
+        const bool playback_failed = failed_ || media.failed;
         join();
         loading_ = false;
         media.close();
         decoder.reset();
         playing_ = false;
-        const char *message = failed_ ? "Could not play this stream" : "Safari video finished";
+        const char *message = no_picture ? "Safari source returned no video" :
+            (playback_failed || ended_early) ? "Safari video interrupted" : "Safari video finished";
         show_status(message);
         shell.screen(message, "");
     }
