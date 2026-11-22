@@ -1,6 +1,6 @@
 {
   "id": "com.github.danlflh.uxplaywebos",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "vendor": "UxPlay webOS",
   "type": "native",
   "main": "uxplay-webos",

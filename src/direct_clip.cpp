@@ -23,6 +23,10 @@ constexpr int64_t ns_per_second = 1000000000;
 constexpr int64_t ns_per_ms = 1000000;
 constexpr int64_t timeout_ns = 5 * ns_per_second;
 constexpr size_t max_packet_size = 1024 * 1024;
+constexpr size_t max_queue_packets = 128;
+constexpr size_t max_queue_bytes = 8 * 1024 * 1024;
+constexpr int64_t rebuffer_delay = 120 * ns_per_ms;
+constexpr int64_t resume_buffer = 350 * ns_per_ms;
 
 bool http_url(const std::string &url) {
     if (url.size() > 8192 || url.find_first_of(" \t\r\n\\") != std::string::npos) return false;
@@ -99,6 +103,7 @@ bool DirectClip::play(const char *url, double start) {
     authorized_clip_ = true;
     requested_source_ = source;
     new_clip_ = true;
+    reopen_input_ = false;
     requested_position_ = std::isfinite(start) && start >= 0 && start <= 36000 ? start : 0;
     start_requested_ = true;
     stop_requested_ = requested_pause_ = false;
@@ -208,6 +213,7 @@ void DirectClip::join(bool keep_input) {
     if (!keep_input) close_input();
     std::lock_guard<std::mutex> lock(mutex_);
     queue_.clear();
+    queued_bytes_ = 0;
     ready_ = false;
     duration_ms_ = position_ms_ = -1;
 }
@@ -269,8 +275,12 @@ bool DirectClip::load_playlist(const std::string &url, std::string &resolved) {
 
 bool DirectClip::enqueue(Sample sample) {
     std::unique_lock<std::mutex> lock(mutex_);
-    available_.wait(lock, [&] { return interrupted_ || queue_.size() < 64; });
+    available_.wait(lock, [&] {
+        return interrupted_ || (queue_.size() < max_queue_packets &&
+            queued_bytes_ + sample.data.size() <= max_queue_bytes);
+    });
     if (interrupted_) return false;
+    queued_bytes_ += sample.data.size();
     queue_.push_back(std::move(sample));
     return true;
 }
@@ -380,8 +390,12 @@ void DirectClip::read(double start, std::string source) {
         while (!interrupted_) {
             deadline_ = now_ns() + timeout_ns;
             const int result = av_read_frame(input, packet.get());
-            if (result == AVERROR_EOF) return true;
-            if (result < 0) return false;
+            const bool timed_out = now_ns() >= deadline_;
+            if (result == AVERROR_EOF && !timed_out) return true;
+            if (result < 0 || (packet->flags & AV_PKT_FLAG_CORRUPT)) {
+                read_error_ = !interrupted_;
+                return false;
+            }
             if (packet->stream_index == video) {
                 if (av_bsf_send_packet(filter, packet.get()) < 0) return false;
                 int filtered;
@@ -419,7 +433,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         fprintf(stderr, "[remote] quick seek to %d seconds\n", target);
         seek(target);
     }
-    bool start, stop_requested, pause, new_clip;
+    bool start, stop_requested, pause, new_clip, reopen;
     double seek;
     std::string source;
     {
@@ -428,9 +442,10 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         stop_requested = stop_requested_;
         pause = requested_pause_ || (scrub_seconds_ >= 0 && !loading_);
         new_clip = new_clip_;
+        reopen = reopen_input_;
         if (start) source = requested_source_;
         seek = requested_position_;
-        start_requested_ = stop_requested_ = new_clip_ = false;
+        start_requested_ = stop_requested_ = new_clip_ = reopen_input_ = false;
     }
     if (start || (stop_requested && (playing_ || worker_.joinable()))) {
         if (playing_) {
@@ -450,20 +465,23 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
             if (keep_picture) fprintf(stderr, "[direct] seek loader started\n");
             next_loader_draw_ = 0;
         }
-        join(!stop_requested && !new_clip);
+        join(!stop_requested && !new_clip && !reopen);
         if (stop_requested || new_clip) {
+            network_retries_ = 0;
             scrub_seconds_ = -1;
             scrub_commit_at_ = 0;
         }
         media.close();
         decoder.reset();
         playing_ = paused_ = false;
+        rebuffering_ = false;
+        empty_since_ = 0;
         if (stop_requested) return false;
         preview_at_ = seek > 0 ? int64_t(seek * ns_per_second) : (pause ? 0 : -1);
         controls_until_ = now_ns() + 4 * ns_per_second;
         before_start();
         interrupted_ = false;
-        finished_ = failed_ = false;
+        finished_ = failed_ = read_error_ = false;
         feeds_ = audio_feeds_ = 0;
         worker_ = std::thread(&DirectClip::read, this, seek, std::move(source));
     }
@@ -487,12 +505,51 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
     {
         const int64_t now = now_ns();
         if (playing_ && paused_ != pause) {
-            media.pause(pause);
+            empty_since_ = 0;
+            media.pause(pause || rebuffering_);
             if (pause) paused_at_ = now;
             else if (origin_ != 0) origin_ += now - paused_at_;
             paused_ = pause;
             media.redraw();
         }
+    }
+    if (playing_ && !paused_ && preview_at_ < 0 && origin_ != 0 && !finished_) {
+        const int64_t now = now_ns();
+        bool start_buffering = false, resume = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (queue_.empty()) {
+                if (empty_since_ == 0) empty_since_ = now;
+                start_buffering = !rebuffering_ && now - empty_since_ >= rebuffer_delay;
+            } else {
+                empty_since_ = 0;
+                const bool enough = queue_.back().decode_at - queue_.front().decode_at >= resume_buffer ||
+                    queue_.size() == max_queue_packets || queued_bytes_ > max_queue_bytes - max_packet_size;
+                resume = rebuffering_ && enough;
+                if (resume) origin_ = now - queue_.front().decode_at;
+            }
+        }
+        if (start_buffering) {
+            rebuffering_ = loading_ = true;
+            loading_target_ = -1;
+            media.pause(true);
+            media.begin_loading(true);
+            fprintf(stderr, "[direct] buffering\n");
+        } else if (resume) {
+            rebuffering_ = loading_ = false;
+            media.end_loading();
+            media.pause(false);
+            fprintf(stderr, "[direct] resumed\n");
+        }
+    }
+    if (rebuffering_ && finished_ && !paused_) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!queue_.empty()) origin_ = now_ns() - queue_.front().decode_at;
+        }
+        rebuffering_ = loading_ = false;
+        media.end_loading();
+        media.pause(false);
     }
     bool empty = false;
     for (int budget = 0; budget < 6; ++budget) {
@@ -500,17 +557,19 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         {
             std::lock_guard<std::mutex> lock(mutex_);
             empty = queue_.empty();
-            if (empty || !playing_ || (paused_ && preview_at_ < 0)) break;
+            if (empty || !playing_ || rebuffering_ || (paused_ && preview_at_ < 0)) break;
             const auto now = now_ns();
             if (preview_at_ < 0) {
                 if (origin_ == 0) origin_ = now - queue_.front().decode_at;
                 if (queue_.front().decode_at > now - origin_) break;
             }
+            queued_bytes_ -= queue_.front().data.size();
             sample = std::move(queue_.front());
             queue_.pop_front();
         }
         available_.notify_one();
         if (sample.video) {
+            if (preview_at_ < 0) media.set_playback_clock(now_ns() - origin_);
             if (media.feed(sample.data.data(), sample.data.size(), sample.pts, true) ==
                 FeedResult::Error) {
                 stop();
@@ -521,7 +580,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
                 fprintf(stderr, "[direct] packets=%u frames=%u audio=%u\n",
                         count, media.frames.load(), audio_feeds_.load());
             }
-        } else if (preview_at_ < 0) {
+        } else if (preview_at_ < 0 && sample.pts >= now_ns() - origin_ - 160 * ns_per_ms) {
             std::vector<uint8_t> pcm;
             if (decoder.decode(4, sample.data.data(), sample.data.size(), pcm) && !pcm.empty()) {
                 if (media.feed(pcm.data(), pcm.size(), sample.pts, false) == FeedResult::Accepted) ++audio_feeds_;
@@ -530,6 +589,9 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         position_ms_ = int(std::max(int64_t(0), sample.decode_at) / ns_per_ms);
         if (sample.video && preview_at_ >= 0 && media.frames > 0) {
             preview_at_ = -1;
+            // Anchor playback to the prefetched frame after a seek.
+            origin_ = now_ns() - sample.decode_at;
+            if (paused_) paused_at_ = now_ns();
         }
         if (loading_ && preview_at_ < 0 && media.frames > 0) {
             loading_ = false;
@@ -539,6 +601,19 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         }
     }
     if (finished_ && empty) {
+        const int position = position_ms_;
+        if (failed_ && read_error_ && position > 0 &&
+            position + int64_t(500) < duration_ms_ && network_retries_ < 2) {
+            std::lock_guard<std::mutex> lock(requests_);
+            if (authorized_clip_ && !start_requested_ && !stop_requested_) {
+                requested_position_ = position / 1000.0;
+                reopen_input_ = start_requested_ = true;
+                ++network_retries_;
+                fprintf(stderr, "[direct] reconnecting at %.2f s (attempt %u)\n",
+                        requested_position_, network_retries_);
+                return true;
+            }
+        }
         media.end_loading();
         media.eos();
         fprintf(stderr, "[direct] done packets=%u frames=%u audio=%u\n",
@@ -567,7 +642,7 @@ void DirectClip::info(playback_info_t &out) const {
         out.rate = requested_pause_ ? 0 : 1;
     }
     out.ready_to_play = ready_;
-    out.playback_buffer_empty = !ready_;
+    out.playback_buffer_empty = !ready_ || rebuffering_;
     out.playback_buffer_full = false;
-    out.playback_likely_to_keep_up = ready_;
+    out.playback_likely_to_keep_up = ready_ && !rebuffering_;
 }

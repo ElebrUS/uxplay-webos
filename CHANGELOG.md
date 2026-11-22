@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6]
+
+- Resume Safari playback from a short buffer after transient network stalls.
+- Retry interrupted reads on seekable clips, up to twice per clip.
+- Reduce expensive uploads and discard stale audio when direct playback falls behind.
+- Use resolution and frame rate to choose a sustainable HLS variant.
+
 ## [0.3.5]
 
 - Include the webOS startup and connection recovery patch in reproducible builds.

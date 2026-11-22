@@ -19,4 +19,12 @@ int main() {
                        "video/360.m3u8\n");
     const std::string media = "#EXTM3U\n#EXTINF:6,\nclip.ts\n";
     assert(select_hls_rendition(media) == media);
+    const std::string mixed_rates = master +
+        "#EXT-X-STREAM-INF:RESOLUTION=854x480,FRAME-RATE=59.94,BANDWIDTH=2000000\n480-fast.m3u8\n"
+        "#EXT-X-STREAM-INF:RESOLUTION=854x480,FRAME-RATE=23.976,BANDWIDTH=1500000\n480-heavy.m3u8\n"
+        "#EXT-X-STREAM-INF:RESOLUTION=854x480,FRAME-RATE=23.976,BANDWIDTH=900000\n480-light.m3u8\n";
+    assert(select_hls_rendition(mixed_rates).find("\n480-light.m3u8\n") != std::string::npos);
+    assert(select_hls_rendition(master +
+        "#EXT-X-STREAM-INF:RESOLUTION=854x480,FRAME-RATE=59.94\nfast.m3u8\n")
+        .find("\nvideo/360.m3u8\n") != std::string::npos);
 }

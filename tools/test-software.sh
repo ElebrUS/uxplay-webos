@@ -3,6 +3,9 @@ set -eu
 cd "$(dirname "$0")/.."
 build_dir="${TEST_BUILD_DIR:-build/software-test}"
 mkdir -p "$build_dir"
+"${CXX:-c++}" -std=c++11 -Wall -Wextra -Isrc tests/hls_playlist.cpp src/hls_playlist.cpp \
+    -o "$build_dir/hls-playlist"
+"$build_dir/hls-playlist"
 for dimensions in 640x360 360x640; do
     "${FFMPEG:-ffmpeg}" -hide_banner -loglevel error -y -f lavfi \
         -i "testsrc2=size=${dimensions}:rate=30" -frames:v 60 \

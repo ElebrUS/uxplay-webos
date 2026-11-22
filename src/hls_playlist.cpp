@@ -1,5 +1,7 @@
 #include "hls_playlist.h"
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -43,7 +45,9 @@ std::string select_hls_rendition(const std::string &playlist) {
         lines.push_back(std::move(line));
     }
 
-    int best = -1, best_score = -100000000;
+    int best = -1;
+    double best_score = -std::numeric_limits<double>::infinity();
+    unsigned long long best_bandwidth = 0;
     std::string resource;
     std::string best_audio;
     std::vector<std::string> selected;
@@ -57,15 +61,27 @@ std::string select_hls_rendition(const std::string &playlist) {
         const auto resolution = attribute(fields, "RESOLUTION");
         sscanf(resolution.c_str(), "%ux%u", &width, &height);
         if (width > 1920 || height > 1088) continue;
-        constexpr int preferred = 640 * 360;
+        double fps = 30;
+        const auto rate = attribute(fields, "FRAME-RATE");
+        if (sscanf(rate.c_str(), "%lf", &fps) != 1 || !std::isfinite(fps) || fps <= 0 || fps > 240)
+            fps = 30;
         const int pixels = int(width * height);
-        const int score = pixels <= preferred ? pixels : preferred - (pixels - preferred);
+        const double work = pixels * fps;
+        constexpr double budget = 854 * 480 * 24;
+        // Prefer the sharpest variant inside the decode budget. If every known
+        // variant exceeds it, pick the cheapest one.
+        const double score = pixels == 0 ? 0 : work <= budget ? budget + pixels : -work;
+        unsigned long long bandwidth = 0;
+        const auto bandwidth_field = attribute(fields, "BANDWIDTH");
+        sscanf(bandwidth_field.c_str(), "%llu", &bandwidth);
         size_t j = i + 1;
         while (j < lines.size() && lines[j].empty()) ++j;
         if (j >= lines.size() || lines[j].front() == '#') continue;
-        if (best >= 0 && score <= best_score) continue;
+        if (score < best_score || (score == best_score &&
+            (bandwidth == 0 || (best_bandwidth != 0 && bandwidth >= best_bandwidth)))) continue;
         best = int(i);
         best_score = score;
+        best_bandwidth = bandwidth;
         resource = lines[j];
         best_audio = attribute(fields, "AUDIO");
         selected = fields;

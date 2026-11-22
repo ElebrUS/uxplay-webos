@@ -26,6 +26,9 @@ struct Media::Impl {
     AVFrame *frame = nullptr;
     AVPacket *packet = nullptr;
     int64_t first_visible_pts = std::numeric_limits<int64_t>::min();
+    int64_t playback_pts = 0;
+    bool clock_active = false;
+    Uint32 last_presented_at = 0;
     using UpdateYuv = decltype(&SDL_UpdateYUVTexture);
     UpdateYuv update_yuv = reinterpret_cast<UpdateYuv>(dlsym(RTLD_DEFAULT, "SDL_UpdateYUVTexture"));
     std::vector<uint8_t> planar;
@@ -179,6 +182,10 @@ bool Media::open_clip(int width, int height, bool audio) {
 }
 
 void Media::show_frames_from(int64_t pts_ns) { impl_->first_visible_pts = pts_ns; }
+void Media::set_playback_clock(int64_t pts_ns) {
+    impl_->playback_pts = pts_ns;
+    impl_->clock_active = true;
+}
 
 bool Media::open_decoder(int width, int height, bool audio, int rate, bool buffered) {
     close();
@@ -254,14 +261,22 @@ FeedResult Media::receive_frames(bool present_video) {
     auto &state = *impl_;
     int result;
     while ((result = avcodec_receive_frame(state.decoder, state.frame)) == 0) {
-        const bool visible = present_video && state.frame->pts >= state.first_visible_pts;
+        const Uint32 now = SDL_GetTicks();
+        // Decode reference frames normally. Skip expensive uploads only while catching up.
+        const bool late = state.clock_active && state.frame->pts != AV_NOPTS_VALUE &&
+            state.frame->pts < state.playback_pts - 120000000;
+        const bool visible = present_video && state.frame->pts >= state.first_visible_pts &&
+            (!late || frames == 0 || now - state.last_presented_at >= 100);
         const bool ok = !visible || state.present();
         av_frame_unref(state.frame);
         if (!ok) {
             std::fprintf(stderr, "[video] SDL presentation failed: %s\n", SDL_GetError());
             return FeedResult::Error;
         }
-        if (visible) ++frames;
+        if (visible) {
+            ++frames;
+            state.last_presented_at = now;
+        }
     }
     return result == AVERROR(EAGAIN) || result == AVERROR_EOF || result == AVERROR_INVALIDDATA ?
         FeedResult::Accepted : FeedResult::Error;
@@ -269,6 +284,7 @@ FeedResult Media::receive_frames(bool present_video) {
 
 void Media::tick() {}
 void Media::eos() {
+    impl_->clock_active = false;
     if (impl_->decoder && avcodec_send_packet(impl_->decoder, nullptr) == 0)
         failed = receive_frames(true) == FeedResult::Error;
 }
@@ -288,6 +304,7 @@ void Media::close() {
     av_frame_free(&state.frame);
     avcodec_free_context(&state.decoder);
     state.first_visible_pts = std::numeric_limits<int64_t>::min();
+    state.clock_active = false;
     ready = playing = ended = failed = false;
     frames = 0;
 }

@@ -15,6 +15,7 @@ public:
     explicit Media(SDL_Renderer *renderer);
     bool open_clip(int width, int height, bool audio);
     void show_frames_from(int64_t pts_ns);
+    void set_playback_clock(int64_t pts_ns);
     void set_overlay(std::function<void()> overlay);
     void redraw();
     void begin_loading(bool preserve_frame);
