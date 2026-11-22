@@ -27,11 +27,22 @@ int main() {
     assert(select_hls_rendition(master +
         "#EXT-X-STREAM-INF:RESOLUTION=854x480,FRAME-RATE=59.94\nfast.m3u8\n")
         .find("\nvideo/360.m3u8\n") != std::string::npos);
-    std::vector<int> heights;
-    const auto manual = select_hls_rendition(mixed_rates, 720, &heights);
-    assert((heights == std::vector<int>{360, 480, 720}));
+    HlsSelection selection;
+    const auto manual = select_hls_rendition(mixed_rates, 720, &selection);
+    assert((selection.heights == std::vector<int>{360, 480, 720}));
     assert(manual.find("\n720.m3u8\n") != std::string::npos);
     assert(manual.find("audio/main.m3u8") != std::string::npos);
     assert(select_hls_rendition(mixed_rates, 1080).find("\n480-light.m3u8\n") != std::string::npos);
-    assert(select_hls_rendition(media, 720, &heights) == media && heights.empty());
+    const std::string hd = mixed_rates +
+        "#EXT-X-STREAM-INF:RESOLUTION=1280x720,FRAME-RATE=30,BANDWIDTH=2500000,CODECS=\"avc1.640028\"\n720-auto.m3u8\n"
+        "#EXT-X-STREAM-INF:RESOLUTION=1920x1080,FRAME-RATE=29.97,BANDWIDTH=4500000,CODECS=\"avc1.640028\"\n1080-auto.m3u8\n"
+        "#EXT-X-STREAM-INF:RESOLUTION=1920x1080,FRAME-RATE=60,BANDWIDTH=5000000,CODECS=\"avc1.64002a\"\n1080-fast.m3u8\n"
+        "#EXT-X-STREAM-INF:RESOLUTION=1920x1080,FRAME-RATE=30,BANDWIDTH=8000000,CODECS=\"avc1.640028\"\n1080-heavy.m3u8\n";
+    assert(select_hls_rendition(hd, 0, &selection, true).find("\n1080-auto.m3u8\n") != std::string::npos);
+    assert(selection.promoted_for_hardware);
+    assert(select_hls_rendition(hd, 0, &selection).find("\n480-light.m3u8\n") != std::string::npos);
+    assert(!selection.promoted_for_hardware);
+    assert(select_hls_rendition(hd, 360, &selection, true).find("\nvideo/360.m3u8\n") != std::string::npos);
+    assert(!selection.promoted_for_hardware);
+    assert(select_hls_rendition(media, 720, &selection, true) == media && selection.heights.empty());
 }

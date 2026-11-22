@@ -306,14 +306,16 @@ bool DirectClip::load_playlist(const std::string &url, std::string &resolved) {
     }
     avio_closep(&network);
     if (count != AVERROR_EOF || playlist_text_.compare(0, 7, "#EXTM3U") != 0) return false;
-    std::vector<int> heights;
-    const auto filtered = select_hls_rendition(playlist_text_, quality_height_, &heights);
+    HlsSelection selection;
+    const auto filtered = select_hls_rendition(playlist_text_, quality_height_, &selection, prefer_hardware_hls_);
+    promoted_hls_ = selection.promoted_for_hardware;
     {
         std::lock_guard<std::mutex> lock(requests_);
-        multiple_renditions_ = heights.size() >= 2;
-        rendition_heights_ = std::move(heights);
+        multiple_renditions_ = selection.heights.size() >= 2;
+        rendition_heights_ = std::move(selection.heights);
     }
-    if (filtered != playlist_text_) fprintf(stderr, "[direct] selected one H.264 variant before opening segments\n");
+    if (filtered != playlist_text_)
+        fprintf(stderr, "[direct] selected H.264 variant, hardware preference=%d\n", int(promoted_hls_));
     playlist_text_ = filtered;
 
     auto *scratch = static_cast<uint8_t *>(av_malloc(4096));
@@ -402,7 +404,10 @@ void DirectClip::read(double start, std::string source) {
         const AVCodecParameters *video_params = input->streams[video]->codecpar;
         if (video_params->codec_id != AV_CODEC_ID_H264) return false;
         const int profile = video_params->profile;
-        hardware_eligible_ = input->duration > 0 && video_params->height >= 720 &&
+        const AVRational frame_rate = av_guess_frame_rate(input, input->streams[video], nullptr);
+        fprintf(stderr, "[direct] nominal video rate=%d/%d\n", frame_rate.num, frame_rate.den);
+        hardware_eligible_ = input->duration > 0 && video_params->height >= 360 &&
+            (frame_rate.num <= 0 || av_q2d(frame_rate) <= 30.01) &&
             (video_params->format == AV_PIX_FMT_YUV420P || video_params->format == AV_PIX_FMT_YUVJ420P) &&
             (profile == AV_PROFILE_H264_BASELINE || profile == AV_PROFILE_H264_CONSTRAINED_BASELINE ||
              profile == AV_PROFILE_H264_MAIN || profile == AV_PROFILE_H264_HIGH);
@@ -532,7 +537,8 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             if (keep_picture) fprintf(stderr, "[direct] seek loader started\n");
             next_loader_draw_ = 0;
         }
-        join(!stop_requested && !new_clip && !reopen);
+        const bool reuse_input = !stop_requested && !new_clip && !reopen;
+        join(reuse_input);
         quality_index_ = -1;
         if (stop_requested || new_clip) {
             hardware_failed_ = false;
@@ -545,6 +551,8 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             scrub_commit_at_ = 0;
         }
         quality_height_ = next_quality_height_;
+        prefer_hardware_hls_ = media.hardware_enabled() && !hardware_failed_;
+        if (!reuse_input) promoted_hls_ = false;
         media.close();
         decoder.reset();
         playing_ = paused_ = false;
@@ -554,6 +562,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         next_hardware_draw_ = 0;
         hardware_drain_until_ = 0;
         hardware_overlay_visible_ = false;
+        last_hardware_feed_ = max_hardware_gap_ = max_hardware_lateness_ = 0;
         if (stop_requested) return false;
         preview_at_ = seek > 0 ? int64_t(seek * ns_per_second) : (pause ? 0 : -1);
         controls_until_ = now_ns() + 4 * ns_per_second;
@@ -577,6 +586,15 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
                 hardware_failed_ = true;
                 fprintf(stderr, "[direct] LGNC unavailable, using software\n");
             }
+            if (promoted_hls_ && !media.hardware_video()) {
+                std::lock_guard<std::mutex> lock(requests_);
+                if (authorized_clip_ && !start_requested_ && !stop_requested_) {
+                    hardware_failed_ = true;
+                    reopen_input_ = start_requested_ = true;
+                    fprintf(stderr, "[direct] retrying Auto HLS with a software rendition\n");
+                }
+                return true;
+            }
             if (preview_at_ >= 0) media.show_frames_from(preview_at_);
             playing_ = true;
             origin_ = 0;
@@ -590,7 +608,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         const bool show_overlay = paused_ || quality_index_ >= 0 || scrub_seconds_ >= 0 || now < controls_until_;
         if ((show_overlay && now >= next_hardware_draw_) || (hardware_overlay_visible_ && !show_overlay)) {
             media.redraw();
-            next_hardware_draw_ = now + 120 * ns_per_ms;
+            next_hardware_draw_ = now + 250 * ns_per_ms;
             hardware_overlay_visible_ = show_overlay;
         }
     }
@@ -598,6 +616,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         const int64_t now = now_ns();
         if (playing_ && paused_ != pause) {
             empty_since_ = 0;
+            last_hardware_feed_ = 0;
             media.pause(pause || rebuffering_);
             if (pause) paused_at_ = now;
             else if (origin_ != 0) origin_ += now - paused_at_;
@@ -622,6 +641,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             }
         }
         if (start_buffering) {
+            last_hardware_feed_ = 0;
             rebuffering_ = loading_ = true;
             loading_target_ = -1;
             media.pause(true);
@@ -660,7 +680,8 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             queue_.pop_front();
         }
         if (sample.video) {
-            if (preview_at_ < 0) media.set_playback_clock(now_ns() - origin_);
+            const int64_t submit_at = now_ns();
+            if (preview_at_ < 0) media.set_playback_clock(submit_at - origin_);
             const auto result = media.feed(sample.data.data(), sample.data.size(), sample.pts, true);
             if (result == FeedResult::Retry) {
                 const int64_t now = now_ns();
@@ -687,10 +708,22 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
                 stop();
                 break;
             }
+            if (media.hardware_video() && preview_at_ < 0) {
+                if (last_hardware_feed_ != 0)
+                    max_hardware_gap_ = std::max(max_hardware_gap_, submit_at - last_hardware_feed_);
+                last_hardware_feed_ = submit_at;
+                max_hardware_lateness_ = std::max(max_hardware_lateness_, submit_at - origin_ - sample.decode_at);
+            }
             const unsigned count = ++feeds_;
             if (count == 1 || count % 150 == 0) {
                 fprintf(stderr, "[direct] packets=%u frames=%u audio=%u\n",
                         count, media.frames.load(), audio_feeds_.load());
+                if (media.hardware_video() && count > 1) {
+                    fprintf(stderr, "[lgnc] max feed gap=%lld ms late=%lld ms\n",
+                            static_cast<long long>(max_hardware_gap_ / ns_per_ms),
+                            static_cast<long long>(max_hardware_lateness_ / ns_per_ms));
+                    max_hardware_gap_ = max_hardware_lateness_ = 0;
+                }
             }
         } else if (preview_at_ < 0 && sample.pts >= now_ns() - origin_ - 160 * ns_per_ms) {
             std::vector<uint8_t> pcm;
@@ -729,6 +762,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         if ((no_picture || ended_early || (failed_ && read_error_)) && network_retries_ < 2) {
             std::lock_guard<std::mutex> lock(requests_);
             if (authorized_clip_ && !start_requested_ && !stop_requested_) {
+                if (promoted_hls_ && no_picture) hardware_failed_ = true;
                 if (!fallback_source_.empty() && no_picture) {
                     requested_source_ = std::move(fallback_source_);
                     fallback_source_.clear();

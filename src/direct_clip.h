@@ -82,10 +82,15 @@ private:
     bool playing_ = false;
     bool paused_ = false;
     bool hardware_failed_ = false;
+    bool prefer_hardware_hls_ = false;
+    std::atomic<bool> promoted_hls_{false};
     int64_t hardware_retry_since_ = 0;
     int64_t next_hardware_draw_ = 0;
     int64_t hardware_drain_until_ = 0;
     bool hardware_overlay_visible_ = false;
+    int64_t last_hardware_feed_ = 0;
+    int64_t max_hardware_gap_ = 0;
+    int64_t max_hardware_lateness_ = 0;
     double requested_position_ = 0;
     bool loading_ = false;
     std::atomic<bool> rebuffering_{false};
