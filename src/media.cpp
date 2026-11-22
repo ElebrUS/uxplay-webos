@@ -55,7 +55,7 @@ bool Media::open(const char *app_id, int width, int height, bool audio, int rate
                  << ",\"bitsPerSample\":16,\"layout\":\"interleaved\"}";
     p << "},\"restartStreaming\":false,\"streamQualityInfo\":true,\"streamQualityInfoNonFlushable\":true,\"totalStreamSize\":256,"
          "\"bufferingCtrInfo\":{\"preBufferByte\":0,\"bufferMinLevel\":0,\"bufferMaxLevel\":0,\"qBufferLevelAudio\":0,\"qBufferLevelVideo\":0,"
-         "\"srcBufferLevelAudio\":{\"minimum\":1024,\"maximum\":131072},\"srcBufferLevelVideo\":{\"minimum\":1024,\"maximum\":1048576}}},"
+         "\"srcBufferLevelAudio\":{\"minimum\":1024,\"maximum\":524288},\"srcBufferLevelVideo\":{\"minimum\":1024,\"maximum\":4194304}}},"
          "\"adaptiveStreaming\":{\"audioOnly\":false,\"maxWidth\":" << width << ",\"maxHeight\":" << height << ",\"maxFrameRate\":30}}}]}";
     fprintf(stderr, "[media] Load %s\n", p.str().c_str());
     loaded_ = api_->Load(p.str().c_str(), event, this);
@@ -81,7 +81,7 @@ void Media::tick() {
         acb_playing_=true;
     }
 }
-FeedResult Media::feed(const void *data, size_t size, int64_t pts_ns, bool video) {
+FeedResult Media::feed(const void *data, size_t size, int64_t pts_ns, bool video, bool) {
     if (!api_ || !loaded_ || failed || !data || !size) return FeedResult::Error;
     char payload[200];
     snprintf(payload, sizeof(payload), "{\"bufferAddr\":\"%p\",\"bufferSize\":%zu,\"pts\":%lld,\"esData\":%d}",

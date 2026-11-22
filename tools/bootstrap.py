@@ -9,6 +9,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CACHE = ROOT / '.cache'
 LOCK = json.loads((ROOT / 'dependencies.lock.json').read_text())
+UXPLAY_PATCH = ROOT / 'tools/patches/uxplay-webos14.patch'
 
 def run(*args, **kw):
     subprocess.run(args, check=True, **kw)
@@ -23,14 +24,25 @@ def main():
                 if not target.exists():
                     target.parent.mkdir(exist_ok=True)
                     run('tar', '-xf', str(embedded), '-C', str(target.parent))
+                check = subprocess.run(['git', 'apply', '--no-index', '--reverse', '--check', str(UXPLAY_PATCH)],
+                                       cwd=target, capture_output=True)
+                if check.returncode:
+                    run('git', 'apply', '--no-index', str(UXPLAY_PATCH), cwd=target)
                 continue
             if not (target / '.git').exists():
                 target.parent.mkdir(exist_ok=True)
                 run('git', 'clone', item['repository'], str(target))
-            status = subprocess.check_output(['git', '-C', str(target), 'status', '--porcelain'], text=True)
-            if status.strip():
-                sys.exit('UxPlay has local modifications; preserve them before bootstrapping.')
-            run('git', '-C', str(target), 'checkout', '--detach', item['commit'])
+            git = ['git', '-C', str(target)]
+            status = subprocess.check_output([*git, 'status', '--porcelain'])
+            if status:
+                head = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
+                patch = subprocess.check_output([*git, 'diff', '--binary', 'HEAD'])
+                if (head != item['commit'] or b'?? ' in status or
+                        patch.splitlines() != UXPLAY_PATCH.read_bytes().splitlines()):
+                    sys.exit('UxPlay has local modifications; preserve them before bootstrapping.')
+            else:
+                run(*git, 'checkout', '--detach', item['commit'])
+                run(*git, 'apply', str(UXPLAY_PATCH))
             continue
         archive = CACHE / item['archive']
         if not archive.exists():

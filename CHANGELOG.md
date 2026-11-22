@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.5]
+
+- Include the webOS startup and connection recovery patch in reproducible builds.
+- Decode direct Safari video using frame threads and skip redundant clears for full-screen video.
+- Preserve presentation timestamps during seeks and drain delayed video frames at end of stream.
+
+## [0.3.4]
+
+- Accept direct HTTP(S) MP4 and unencrypted HLS playback without a per-site profile.
+
+## [0.3.3]
+
+- Preview seek targets before committing, accelerate held arrows, and reuse the MP4 index.
+
+## [0.3.2]
+
+- Redesign the receiver, pairing screen and Safari playback interface.
+
+## [0.3.1]
+
+- Add remote playback controls and a seek bar for direct Safari video.
+
+## [0.3.0]
+
+- Advertise one receiver for screen mirroring and direct Safari playback.
+
+## [0.2.0]
+
+- Add the ACB-free H.264/SDL receiver build for webOS 1.4 qualification.
+- Audit the ARM ELF against glibc 2.14.1 and package the private C++ runtime.
+
 All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

@@ -13,29 +13,32 @@ export LDFLAGS="--sysroot=$sdk/arm-webos-linux-gnueabi/sysroot"
 mkdir -p "$prefix" build/logs
 build_stamp="$(shasum -a 256 "$0" | cut -d ' ' -f 1)"
 previous_stamp="$(cat "$prefix/build-config.sha256" 2>/dev/null || true)"
-if [ "$build_stamp" != "$previous_stamp" ] || [ ! -f "$prefix/lib/libcrypto.a" ]; then
+if [ ! -f "$prefix/lib/libcrypto.a" ]; then
     (cd .cache/openssl-3.5.8
      ./Configure linux-armv4 no-shared no-tests no-module no-async --prefix="$prefix" --libdir=lib
-     make -j6 build_libs
+     make -j"${BUILD_JOBS:-2}" build_libs
      make install_dev) >build/logs/openssl.log 2>&1
 fi
-if [ "$build_stamp" != "$previous_stamp" ] || [ ! -f "$prefix/lib/libplist-2.0.a" ]; then
+if [ ! -f "$prefix/lib/libplist-2.0.a" ]; then
     (cd .cache/libplist-2.7.0
      ./configure --host=arm-webos-linux-gnueabi --prefix="$prefix" --disable-shared --enable-static --without-cython --without-tests
-     make -j6
+     make -j"${BUILD_JOBS:-2}"
      make install) >build/logs/libplist.log 2>&1
 fi
-if [ "$build_stamp" != "$previous_stamp" ] || [ ! -f "$prefix/lib/libavcodec.a" ]; then
+if [ "$build_stamp" != "$previous_stamp" ] || [ ! -f "$prefix/lib/libavformat.a" ]; then
     (cd .cache/ffmpeg-8.1.2
+     export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
+     export PKG_CONFIG_PATH=""
+     make clean
      ./configure --prefix="$prefix" --arch=arm --cpu=cortex-a9 --target-os=linux --enable-cross-compile \
        --sysroot="$sdk/arm-webos-linux-gnueabi/sysroot" \
        --extra-cflags=-Dstatic_assert=_Static_assert \
        --cross-prefix="$sdk/bin/arm-webos-linux-gnueabi-" --disable-everything --disable-programs --disable-doc \
-       --disable-shared --enable-static --enable-pic --disable-autodetect --disable-network \
-       --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale \
-       --enable-avcodec --enable-avutil --enable-swresample --enable-decoder=aac,alac,pcm_s16le \
-       --enable-parser=h264 --enable-small --disable-debug
-     make -j6
+       --disable-shared --enable-static --enable-pic --disable-autodetect --enable-network --enable-openssl --enable-version3 --pkg-config-flags=--static \
+       --disable-avdevice --enable-avformat --disable-avfilter --disable-swscale \
+       --enable-avcodec --enable-avutil --enable-swresample --enable-decoder=aac,alac,pcm_s16le,h264 --disable-zlib \
+       --enable-demuxer=mov,hls,mpegts,aac --enable-protocol=http,https,tcp,tls,udp --enable-bsf=h264_mp4toannexb --enable-parser=h264,aac --enable-small --disable-debug
+     make -j"${BUILD_JOBS:-2}"
      make install) >build/logs/ffmpeg.log 2>&1
 fi
 printf '%s\n' "$build_stamp" > "$prefix/build-config.sha256"

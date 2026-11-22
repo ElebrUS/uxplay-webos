@@ -10,7 +10,11 @@ AudioDecoder::~AudioDecoder() { reset(); }
 void AudioDecoder::reset() {
     swr_free(&resampler_); avcodec_free_context(&context_); codec_ = 0;
 }
-bool AudioDecoder::configure(unsigned codec) {
+bool AudioDecoder::configure_aac(const uint8_t *data, size_t length) {
+    return (length == 0 || (data && length >= 2 && length <= 1024)) &&
+           configure(4, data, length, false);
+}
+bool AudioDecoder::configure(unsigned codec, const uint8_t *data, size_t length, bool use_default_config) {
     reset();
     AVCodecID id = codec == 2 ? AV_CODEC_ID_ALAC : AV_CODEC_ID_AAC;
     if (codec != 2 && codec != 4 && codec != 8) return false;
@@ -19,11 +23,14 @@ bool AudioDecoder::configure(unsigned codec) {
     const uint8_t eld[] = {0xf8,0xe8,0x50,0x00};
     const uint8_t lc[] = {0x12,0x10};
     const uint8_t alac[] = {0,0,0,0x24,0x61,0x6c,0x61,0x63,0,0,0,0,0,0,1,0x60,0,0x10,0x28,0x0a,0x0e,2,0,0xff,0,0,0,0,0,0,0,0,0,0,0xac,0x44};
-    const uint8_t *config = codec==2?alac:codec==8?eld:lc;
-    size_t length = codec==2?sizeof(alac):codec==8?sizeof(eld):sizeof(lc);
-    context_->extradata = static_cast<uint8_t *>(av_mallocz(length + AV_INPUT_BUFFER_PADDING_SIZE));
-    if (!context_->extradata) { reset(); return false; }
-    memcpy(context_->extradata,config,length); context_->extradata_size=length;
+    const uint8_t *config = data ? data : codec==2?alac:codec==8?eld:lc;
+    if (!data && use_default_config) length = codec==2?sizeof(alac):codec==8?sizeof(eld):sizeof(lc);
+    if (length) {
+        context_->extradata = static_cast<uint8_t *>(av_mallocz(length + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (!context_->extradata) { reset(); return false; }
+        memcpy(context_->extradata, config, length);
+        context_->extradata_size = length;
+    }
     context_->sample_rate=44100;
     av_channel_layout_default(&context_->ch_layout,2);
     if (avcodec_open2(context_,decoder,nullptr)<0) { reset(); return false; }

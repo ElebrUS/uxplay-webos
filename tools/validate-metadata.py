@@ -17,7 +17,7 @@ def fail(message):
 def main():
     if APP['id'] != EXPECTED_ID:
         fail('unexpected application ID')
-    if APP['title'] != EXPECTED_NAME or APP['vendor'] != EXPECTED_NAME:
+    if APP['title'] != EXPECTED_NAME or APP['vendor'] != 'UxPlay webOS':
         fail('title and vendor must use the public product name')
     if APP['main'] != 'uxplay-webos':
         fail('unexpected executable name')

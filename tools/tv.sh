@@ -24,7 +24,7 @@ case "${1:-}" in
     # Atomic replacement avoids ETXTBSY and preserves on-device pairing state.
     python3 tools/package.py
     scp "${ssh_options[@]}" build/app/uxplay-webos "root@$tv_host:$app_dir/uxplay-webos.next"
-    ares-launch -d "$tv_device" -c "$app_id"
+    ares-launch -d "$tv_device" -c "$app_id" || true
     ssh -tt "${ssh_options[@]}" "root@$tv_host" "chmod 755 '$app_dir/uxplay-webos.next' && mv '$app_dir/uxplay-webos.next' '$app_dir/uxplay-webos'"
     ares-launch -d "$tv_device" "$app_id"
     ;;

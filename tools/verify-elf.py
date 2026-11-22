@@ -28,18 +28,24 @@ def main():
             sys.exit(f'Wrong target ABI: {file}')
         versions = output('-V',file).split('Version needs section')[-1]
         for v in re.findall(r'Name: GLIBC_(\d+(?:\.\d+)+)', versions):
-            if version(v)>version('2.19'):
-                sys.exit(f'{file}: requires GLIBC_{v}, newer than TV 2.19')
+            if version(v)>version('2.14.1'):
+                sys.exit(f'{file}: requires GLIBC_{v}, newer than TV 2.14.1')
         for name in re.findall(r'Name: ((?:GLIBCXX|CXXABI)[_A-Z.0-9]+)',versions):
             if name not in exported:
                 sys.exit(f'{file}: bundled C++ runtime lacks {name}')
+    if '/lib/ld-linux.so.3]' not in output('-l', files[0]):
+        sys.exit('Unexpected dynamic interpreter')
+    for file in files:
+        attrs = output('-A', file)
+        if 'Tag_CPU_arch: v7' not in attrs or 'Tag_ABI_VFP_args: VFP registers' in attrs:
+            sys.exit(f'Unexpected CPU attributes: {file}')
     dynamic = output('-d',files[0])
     if '$ORIGIN/lib' not in dynamic:
         sys.exit('Missing private runtime search path')
-    for bad in ['libcrypto.so', 'libplist', 'libavcodec', 'libgstreamer', 'libX11']:
+    for bad in ['libcrypto.so', 'libplist', 'libavcodec', 'libgstreamer', 'libX11', 'libAcbAPI', 'libplayerAPIs', 'libNDL', 'libSDL2_ttf']:
         if bad in dynamic:
             sys.exit(f'Unexpected dynamic dependency: {bad}')
-    print('ELF preflight: ARM32 soft-float ABI; glibc <= 2.19; private C++ runtime resolves version requirements.')
+    print('ELF preflight: ARM32 soft-float ABI; glibc <= 2.14.1; private C++ runtime resolves version requirements.')
 
 if __name__ == '__main__':
     main()

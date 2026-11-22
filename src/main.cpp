@@ -1,4 +1,7 @@
 #include "audio.h"
+#ifdef DIRECT_EXPERIMENT
+#include "direct_clip.h"
+#endif
 #include "h264.h"
 #include "media.h"
 #include "receiver.h"
@@ -12,15 +15,29 @@ int main() {
     umask(0077);start_log("uxplay.log");
     Shell shell;if(!shell.open())return 1;
     shell.screen("Starting AirPlay receiver","");
+#ifdef DIRECT_EXPERIMENT
+    DirectClip direct;
+#endif
     Receiver receiver;
+#ifdef DIRECT_EXPERIMENT
+    receiver.direct = &direct;
+#endif
     if(!receiver.start(app_directory()+"/state")) {
         shell.screen("Could not start. See uxplay.log","");
         while(shell.pump())SDL_Delay(50);
         return 1;
     }
     const char *app_id=getenv("APPID");if(!app_id)app_id="com.github.danlflh.uxplaywebos";
-    Media media;AudioDecoder decoder;
+#ifdef WEBOS14
+    Media media(shell.renderer);
+#else
+    Media media;
+#endif
+    AudioDecoder decoder;
     bool opened=false,have_pending=false,last_paused=false,audio_started=false;
+#ifdef WEBOS14
+    bool video_active = false;
+#endif
     int width=1280,height=720;
     Packet pending;
     std::vector<uint8_t> configuration;
@@ -29,15 +46,40 @@ int main() {
     std::vector<uint8_t> silence(441*4,0);
     int64_t start=0,last_ui=0,last_stats=0,stall=0;
     unsigned video_count=0,audio_count=0,decode_errors=0,late_audio=0,silence_blocks=0;
-    auto finish=[&](){
-        media.close();decoder.reset();receiver.disconnect();opened=false;have_pending=false;
+    auto clear_playback=[&](){
+        media.close();decoder.reset();opened=false;have_pending=false;
+#ifdef WEBOS14
+        video_active = false;
+#endif
         origin=0;start=0;stall=0;audio_end=0;configuration.clear();last_ui=0;last_paused=false;audio_started=false;
     };
+    auto finish=[&](){ clear_playback(); receiver.disconnect(); };
+#ifdef DIRECT_EXPERIMENT
+    bool direct_active = false;
+    media.set_overlay([&]() { direct.draw_controls(shell); });
+    auto start_direct = [&]() {
+        clear_playback();
+        receiver.clear();
+        receiver.reset = false;
+    };
+#endif
     bool running=true;
     while(running) {
         int64_t now=now_ns();
         Action action=shell.action();
         if(action==Action::Exit)break;
+#ifdef DIRECT_EXPERIMENT
+        const bool handled = direct_active && direct.remote(action, media);
+        const bool stop_direct = direct_active && action == Action::Back && !handled;
+        if (stop_direct) direct.stop();
+        direct_active = direct.tick(media, decoder, shell, start_direct,
+                                    [&](const char *status) { receiver.show(status); });
+        if (direct_active || stop_direct || handled) {
+            receiver.reset.exchange(false);
+            SDL_Delay(3);
+            continue;
+        }
+#endif
         if(action==Action::Back) {
             if(opened||receiver.mirror||!receiver.pin().empty())finish();else break;
         }
@@ -80,6 +122,27 @@ int main() {
             have_pending=receiver.pop(pending,latest);
         }
         if(!have_pending){SDL_Delay(3);continue;}
+#ifdef WEBOS14
+        if (!opened && !pending.video && receiver.audio_only) {
+            if (!media.open(app_id, width, height, true)) {
+                finish();
+                receiver.show("Could not start audio.");
+                continue;
+            }
+            opened = true;
+            origin = pending.timestamp;
+            start = now + 200000000;
+            video_count = audio_count = decode_errors = late_audio = silence_blocks = 0;
+            shell.screen("Playing AirPlay audio", "", receiver.audio_delay_ms);
+            fprintf(stderr, "[session] standalone audio\n");
+        }
+        if (opened && !video_active && pending.video) {
+            media.close();
+            decoder.reset();
+            opened = audio_started = false;
+            audio_end = 0;
+        }
+#endif
         if(!opened) {
             // Start on a random-access video frame. Pre-roll audio is intentionally
             // discarded, then both streams share this frame's remote NTP origin.
@@ -94,6 +157,9 @@ int main() {
             }
             opened=true;origin=pending.timestamp;start=now+200000000;stall=0;
             video_count=audio_count=decode_errors=late_audio=silence_blocks=0;
+#ifdef WEBOS14
+            video_active = true;
+#endif
             shell.transparent();
             fprintf(stderr,"[session] %dx%d audio=%d\n",width,height,int(receiver.has_audio));
         }
@@ -107,11 +173,21 @@ int main() {
             if(!info.valid){have_pending=false;continue;}
             if(!info.configuration.empty())configuration=info.configuration;
             if(info.width && (width!=info.width||height!=info.height)) {
+#ifdef WEBOS14
+                width = info.width;
+                height = info.height;
+#else
                 media.close();width=info.width;height=info.height;
                 if(!info.keyframe || !media.open(app_id,width,height,true)) {finish();continue;}
                 origin=pending.timestamp;start=now;pts=0;audio_end=0;audio_started=false;decoder.reset();
+#endif
                 fprintf(stderr,"[session] geometry=%dx%d\n",width,height);
             }
+#ifdef WEBOS14
+            if (info.keyframe && info.configuration.empty() && !configuration.empty()) {
+                pending.data.insert(pending.data.begin(), configuration.begin(), configuration.end());
+            }
+#endif
             pending.codec=1; // Already parsed: do not repeat on decoder back-pressure.
         }
         if(!pending.video && pending.codec!=0) {

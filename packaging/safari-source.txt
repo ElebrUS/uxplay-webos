@@ -1,0 +1,2 @@
+https://devstreaming-cdn.apple.com/videos/wwdc/2019/501psbqh02kzce/501/hls_vod_mvp.m3u8
+https://devstreaming-cdn.apple.com/videos/wwdc/2019/501psbqh02kzce/501/501_sd_reaching_the_big_screen_with_airplay_2.mp4

@@ -16,3 +16,7 @@ The build uses GCC, an eligible compilation process for the Runtime Library Exce
 The webOS Brew native toolchain and samples provide the build environment, headers, link stubs, and technical reference for the port; the samples are not bundled. The native backend was also informed by `mariotaku/ss4s` PCM payload documentation. SDL2, SDL2_ttf, LG fonts, glibc, Starfish Media Pipeline, and ACB are supplied by the TV and are not redistributed.
 
 Daniel Filho ([@danlflh](https://github.com/danlflh)) is the author and maintainer of this webOS port. Run `tools/source-package.py` to create a corresponding-source archive containing this application's source, the pinned UxPlay core, the original dependency source archives, and build instructions. All static libraries can be rebuilt and the app relinked using `tools/build.sh`; installing the resulting `.ipk` on the rooted target uses `tools/tv.sh install`.
+
+The legacy shell uses the basic public-domain bitmap table from [font8x8](https://github.com/dhepper/font8x8). The attribution is preserved in `src/font8x8_basic.h`.
+
+The UI glyph atlas is generated from Inter at [google/fonts revision e1d6480](https://github.com/google/fonts/tree/e1d6480102fed30739fead0faee463101f892c8f/ofl/inter). The SIL Open Font License accompanies the atlas. Run `tools/generate-ui-assets.py` with the pinned variable font to regenerate it.

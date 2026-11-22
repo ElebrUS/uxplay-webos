@@ -9,9 +9,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install host test dependency
-        run: brew install ffmpeg
+      - name: Install host test dependencies
+        run: brew install ffmpeg sdl2 pkgconf
       - name: Validate release metadata and documentation
         run: python3 tools/validate-metadata.py
       - name: Run sanitizer-backed host tests
         run: tools/test.sh
+      - name: Test software playback and seeking
+        run: tools/test-software.sh

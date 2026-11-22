@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 #include "raop.h"
+#ifdef DIRECT_EXPERIMENT
+class DirectClip;
+#endif
 struct Packet {
     bool video;
     unsigned codec;
@@ -14,6 +17,9 @@ struct Packet {
 };
 struct Receiver {
     ~Receiver();
+#ifdef DIRECT_EXPERIMENT
+    DirectClip *direct = nullptr;
+#endif
     bool start(const std::string& directory);
     void stop();
     void disconnect();
@@ -25,7 +31,7 @@ struct Receiver {
     std::string pin();
     void adjust_audio_delay(int delta_ms);
     std::atomic<int> audio_delay_ms{100};
-    std::atomic<bool> reset{false}, audio_flush{false}, paused{false}, has_audio{false}, mirror{false};
+    std::atomic<bool> reset{false}, audio_flush{false}, paused{false}, has_audio{false}, audio_only{false}, mirror{false};
     std::atomic<int> width{1280},height{720};
     std::atomic<float> volume{1};
     std::atomic<int64_t> activity{0};

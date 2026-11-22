@@ -1,9 +1,13 @@
 #include "receiver.h"
+#ifdef DIRECT_EXPERIMENT
+#include "direct_clip.h"
+#endif
 #include "shell.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -11,7 +15,26 @@
 
 static Receiver& self(void *p) { return *static_cast<Receiver *>(p); }
 static void log_message(void *,int level,const char *text) {
-    if (level<=LOGGER_INFO) fprintf(stderr,"[airplay] %s\n",text);
+    // Pairing codes belong in the on-screen prompt, not in persistent logs.
+    if (strstr(text, "CLIENT MUST NOW ENTER PIN")) return;
+    if (level <= LOGGER_INFO) {
+        fprintf(stderr, "[airplay] %s\n", text);
+        return;
+    }
+    static const char *const trace_prefixes[] = {
+        "Handling request SETUP ", "Handling request RECORD ", "Handling request TEARDOWN ",
+        "http_handler_play", "Handling request POST with URL /play",
+        "Handling request GET with URL /server-info",
+        "type = ", "eport = ", "raop_ntp local timing port", "raop_ntp receive timeout",
+        "raop_rtp local ", "RAOP initialized success", "Mirroring initialized successfully",
+        "raop_rtp_mirror local data port", "raop_rtp_mirror accepting client"
+    };
+    for (const char *prefix : trace_prefixes) {
+        if (strncmp(text, prefix, strlen(prefix)) == 0) {
+            fprintf(stderr, "[trace] %s\n", text);
+            return;
+        }
+    }
 }
 void Receiver::show(const std::string& s) { std::lock_guard<std::mutex> l(mutex);message=s; }
 std::string Receiver::status() { std::lock_guard<std::mutex> l(mutex);return message; }
@@ -26,7 +49,8 @@ void Receiver::enqueue(bool video,unsigned codec,uint64_t time,const uint8_t *da
         time=offset>=0?time+uint64_t(offset):time-uint64_t(-offset);
     }
     std::lock_guard<std::mutex> l(mutex);
-    if (bytes+size>4*1024*1024 || packets.size()>=512) { ++overflow; reset=true; return; }
+    // Increased limits: 16MB byte buffer and 2048 packets to handle bursty H.264 streams on webOS 1.4
+    if (bytes+size>16*1024*1024 || packets.size()>=2048) { ++overflow; reset=true; return; }
     Packet p; p.video=video;p.codec=codec;p.timestamp=time;p.data.assign(data,data+size);
     bytes+=size; packets.push_back(std::move(p));
 }
@@ -44,6 +68,13 @@ static bool valid_key(const char *p) {
     return strspn(p,"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")==44;
 }
 bool Receiver::start(const std::string& dir) {
+    FILE *urand = fopen("/dev/urandom", "rb");
+    if (urand) {
+        unsigned char seed[256];
+        size_t n = fread(seed, 1, sizeof(seed), urand);
+        fclose(urand);
+        if (n > 0) RAND_add(seed, static_cast<int>(n), static_cast<double>(n));
+    }
     directory=dir; mkdir(directory.c_str(),0700);
     std::ifstream settings(directory+"/audio-delay-ms");int delay;
     if(settings>>delay)audio_delay_ms=std::max(-1000,std::min(1000,delay));
@@ -61,7 +92,13 @@ bool Receiver::start(const std::string& dir) {
     }
     char device_id[18];snprintf(device_id,sizeof(device_id),"%02X:%02X:%02X:%02X:%02X:%02X",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
     int err=0;
-    dnssd=dnssd_init("UxPlay webOS",12,reinterpret_cast<char *>(mac),6,1,&err);
+    const char *receiver_name = getenv("UXPLAY_NAME");
+    if (!receiver_name || !*receiver_name) receiver_name = "UxPlay webOS";
+#ifdef DIRECT_EXPERIMENT
+    const bool direct_enabled = direct != nullptr;
+
+#endif
+    dnssd=dnssd_init(receiver_name,strlen(receiver_name),reinterpret_cast<char *>(mac),6,1,&err);
     if(!dnssd || err) { show("AirPlay discovery failed");return false; }
     dnssd_set_airplay_features(dnssd,0,0);dnssd_set_airplay_features(dnssd,4,0);
     dnssd_set_airplay_features(dnssd,42,0);dnssd_set_airplay_features(dnssd,27,1);
@@ -70,7 +107,16 @@ bool Receiver::start(const std::string& dir) {
     cb.video_process=[](void *p,raop_ntp_t *,video_decode_struct *d){if(!d->is_h265)self(p).enqueue(true,0,d->ntp_time_remote,d->data,d->data_len);};
     cb.conn_feedback=[](void *p){self(p).activity=now_ns();};
     cb.conn_reset=[](void *p,int reason){fprintf(stderr,"[session] transport reset reason=%d\n",reason);self(p).reset=true;};
-    cb.video_reset=[](void *p,reset_type_t reason){fprintf(stderr,"[session] video reset reason=%d\n",int(reason));self(p).reset=true;};
+    cb.video_reset=[](void *p,reset_type_t reason){
+#ifdef DIRECT_EXPERIMENT
+        if (self(p).direct && (reason == RESET_TYPE_HLS_EOS || reason == RESET_TYPE_HLS_SHUTDOWN)) {
+            self(p).direct->stop();
+            return;
+        }
+#endif
+        fprintf(stderr, "[session] video reset reason=%d\n", int(reason));
+        self(p).reset=true;
+    };
     cb.video_pause=[](void *p){self(p).paused=true;};
     cb.video_resume=[](void *p){self(p).paused=false;};
     cb.audio_flush=[](void *p){self(p).audio_flush=true;};
@@ -79,12 +125,22 @@ bool Receiver::start(const std::string& dir) {
     cb.video_flush=[](void *){};
     cb.audio_set_client_volume=[](void *)->double{return 0.0;};
     cb.audio_set_volume=[](void *p,float db){self(p).volume=db<=-144?0:std::min(1.0f,std::pow(10.0f,db/20.0f));};
-    cb.audio_get_format=[](void *p,unsigned char *,unsigned short *,bool *,bool *,uint64_t *){self(p).has_audio=true;};
+    cb.audio_get_format=[](void *p,unsigned char *codec,unsigned short *samples,bool *screen,bool *media,uint64_t *){
+        fprintf(stderr, "[audio] format codec=%u samples=%u screen=%d media=%d\n",
+                unsigned(*codec), unsigned(*samples), int(*screen), int(*media));
+        self(p).has_audio=true;
+        self(p).audio_only = *media && !*screen;
+    };
     cb.video_report_size=[](void *p,float *,float *,float *w,float *h){
         if(std::isfinite(*w)&&std::isfinite(*h)&&*w>0&&*h>0&&*w<=1920&&*h<=1920) {self(p).width=int(*w);self(p).height=int(*h);}
     };
     cb.video_set_codec=[](void *,video_codec_t c)->int{return c==VIDEO_CODEC_H264?0:-1;};
-    cb.mirror_video_running=[](void *p,bool running){self(p).mirror=running;};
+    cb.mirror_video_running=[](void *p,bool running){
+#ifdef DIRECT_EXPERIMENT
+        if (running && self(p).direct) self(p).direct->stop();
+#endif
+        self(p).mirror=running;
+    };
     cb.report_client_request=[](void *p,char *id,char *model,char *name,bool *admit){
         Receiver& r=self(p);std::lock_guard<std::mutex> l(r.mutex);
         *admit=id && (r.client.empty()||r.client==id);
@@ -106,12 +162,38 @@ bool Receiver::start(const std::string& dir) {
         if(fclose(file)!=0)ok=false;
         if(ok&&rename((path+".tmp").c_str(),path.c_str())==0)r.keys.insert(key);
     };
+#ifdef DIRECT_EXPERIMENT
+    if (direct_enabled) {
+        dnssd_set_airplay_features(dnssd, 0, 1);
+        dnssd_set_airplay_features(dnssd, 4, 1);
+        cb.on_video_play = [](void *p, const char *url, float start) {
+            auto &receiver = self(p);
+            if (!receiver.direct->play(url, start)) receiver.show("This Safari source is not supported");
+        };
+        cb.on_video_scrub = [](void *p, float position) { self(p).direct->seek(position); };
+        cb.on_video_rate = [](void *p, float rate) {
+            if (rate == 0 || rate == 1) self(p).direct->pause(rate == 0);
+        };
+        cb.on_video_stop = [](void *p) { self(p).direct->stop(); };
+        cb.on_video_playlist_remove = [](void *p) -> float {
+            playback_info_t info{};
+            self(p).direct->info(info);
+            return float(info.position);
+        };
+        cb.on_video_acquire_playback_info = [](void *p, playback_info_t *info) {
+            self(p).direct->info(*info);
+        };
+    }
+#endif
     ntp_global_init();
     raop=raop_init(&cb);if(!raop) return false;
-    raop_set_log_callback(raop,log_message,this);raop_set_log_level(raop,LOGGER_INFO);
+    raop_set_log_callback(raop,log_message,this);raop_set_log_level(raop,getenv("UXPLAY_TRACE") ? LOGGER_DEBUG : LOGGER_INFO);
     if(raop_init2(raop,0,device_id,(directory+"/server.key").c_str()))return false;
     raop_set_plist(raop,"width",1280);raop_set_plist(raop,"height",720);
     raop_set_plist(raop,"refreshRate",30);raop_set_plist(raop,"maxFPS",30);raop_set_plist(raop,"pin",0);
+#ifdef DIRECT_EXPERIMENT
+    if (direct_enabled) raop_set_plist(raop, "hls", 1);
+#endif
     raop_set_dnssd(raop,dnssd);
     unsigned short udp[3]={0,0,0},tcp[2]={0,0},port=0;
     raop_set_udp_ports(raop,udp);raop_set_tcp_ports(raop,tcp);
@@ -134,7 +216,7 @@ void Receiver::adjust_audio_delay(int delta) {
 }
 void Receiver::disconnect() {
     if(raop) raop_remove_known_connections(raop);
-    clear(); has_audio=false;mirror=false;paused=false;reset=false;audio_flush=false;last_audio_arrival=0;
+    clear(); has_audio=false;audio_only=false;mirror=false;paused=false;reset=false;audio_flush=false;last_audio_arrival=0;
     show("Waiting for a connection");
 }
 void Receiver::stop() {
