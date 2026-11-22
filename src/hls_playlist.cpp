@@ -1,4 +1,5 @@
 #include "hls_playlist.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -36,7 +37,9 @@ std::string attribute(const std::vector<std::string> &fields, const std::string 
 }
 }
 
-std::string select_hls_rendition(const std::string &playlist) {
+std::string select_hls_rendition(const std::string &playlist, int requested_height,
+                                std::vector<int> *available_heights) {
+    if (available_heights) available_heights->clear();
     if (playlist.find(stream_tag) == std::string::npos) return playlist;
     std::vector<std::string> lines;
     std::istringstream input(playlist);
@@ -48,6 +51,7 @@ std::string select_hls_rendition(const std::string &playlist) {
     int best = -1;
     double best_score = -std::numeric_limits<double>::infinity();
     unsigned long long best_bandwidth = 0;
+    bool best_matches = false;
     std::string resource;
     std::string best_audio;
     std::vector<std::string> selected;
@@ -77,14 +81,23 @@ std::string select_hls_rendition(const std::string &playlist) {
         size_t j = i + 1;
         while (j < lines.size() && lines[j].empty()) ++j;
         if (j >= lines.size() || lines[j].front() == '#') continue;
-        if (score < best_score || (score == best_score &&
-            (bandwidth == 0 || (best_bandwidth != 0 && bandwidth >= best_bandwidth)))) continue;
+        if (available_heights && pixels > 0) available_heights->push_back(int(height));
+        const bool matches = requested_height > 0 && int(height) == requested_height && pixels > 0;
+        if ((best_matches && !matches) || (best_matches == matches &&
+            (score < best_score || (score == best_score &&
+                (bandwidth == 0 || (best_bandwidth != 0 && bandwidth >= best_bandwidth)))))) continue;
         best = int(i);
         best_score = score;
         best_bandwidth = bandwidth;
+        best_matches = matches;
         resource = lines[j];
         best_audio = attribute(fields, "AUDIO");
         selected = fields;
+    }
+    if (available_heights) {
+        auto &heights = *available_heights;
+        std::sort(heights.begin(), heights.end());
+        heights.erase(std::unique(heights.begin(), heights.end()), heights.end());
     }
     if (best < 0) return playlist;
 

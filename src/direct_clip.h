@@ -29,7 +29,7 @@ public:
     bool tick(Media &media, AudioDecoder &decoder, Shell &shell, const std::function<void()> &before_start,
               const std::function<void(const char *)> &show_status);
     bool remote(Action action, Media &media);
-    void draw_controls(Shell &shell) const;
+    void draw_controls(Shell &shell, const Media &media) const;
     void info(playback_info_t &out) const;
 
 private:
@@ -43,11 +43,18 @@ private:
     void join(bool keep_input = false);
     void close_input();
     bool load_playlist(const std::string &url, std::string &resolved);
+    bool quality_remote(Action action);
     bool enqueue(Sample sample);
     std::string profile_url_;
     std::string profile_media_;
     std::string requested_source_;
     std::string fallback_source_;
+    std::vector<int> rendition_heights_;
+    std::atomic<bool> multiple_renditions_{false};
+    std::vector<int> quality_choices_;
+    int quality_index_ = -1;
+    int quality_height_ = 0;
+    int next_quality_height_ = 0;
     std::vector<uint8_t> audio_config_;
     std::thread worker_;
     AVFormatContext *input_ = nullptr;

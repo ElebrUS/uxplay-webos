@@ -94,6 +94,8 @@ Action Shell::action() {
             }
             if (key == SDL_SCANCODE_LEFT) return e.key.repeat ? Action::LeftRepeat : Action::Left;
             if (key == SDL_SCANCODE_RIGHT) return e.key.repeat ? Action::RightRepeat : Action::Right;
+            if (key == SDL_SCANCODE_UP && !e.key.repeat) return Action::Up;
+            if (key == SDL_SCANCODE_DOWN && !e.key.repeat) return Action::Down;
             if(e.key.keysym.scancode==SDL_WEBOS_SCANCODE_EXIT) return Action::Exit;
             if(e.key.keysym.scancode==SDL_WEBOS_SCANCODE_BACK || e.key.keysym.scancode==SDL_SCANCODE_ESCAPE || e.key.keysym.scancode==SDL_SCANCODE_AC_BACK) return Action::Back;
         }
@@ -337,12 +339,15 @@ void Shell::playback_loader() {
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
 }
 
-void Shell::playback_controls(int position, int duration, bool paused, int target, bool confirm_seek) {
+void Shell::playback_controls(int position, int duration, bool paused, int target, bool confirm_seek,
+                              const std::string &quality) {
     const Canvas c(renderer);
     if (c.scale <= 0) return;
     position = std::max(0, std::min(position, duration));
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
     panel(renderer, c, 410, 799, 1100, 224, 42, {15, 21, 34, 233});
+    if (!quality.empty())
+        text(quality, c.x(1453), c.y(864), c.units(19), c.units(265), secondary, Align::Right);
 
     for (int x : {810, 960, 1110}) {
         if (target >= 0 && x == 960) continue;
@@ -387,5 +392,20 @@ void Shell::playback_controls(int position, int duration, bool paused, int targe
         text(paused ? "OK to resume" : "OK to pause", c.x(960), c.y(968), c.units(18),
              c.units(440), primary, Align::Center);
     }
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+}
+
+void Shell::playback_quality(const std::string &selected, const std::string &current, bool demanding) {
+    const Canvas c(renderer);
+    if (c.scale <= 0) return;
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    panel(renderer, c, 650, 330, 620, 310, 36, {15, 21, 34, 247});
+    text("Video quality", c.x(960), c.y(380), c.units(26), c.units(510), secondary, Align::Center);
+    text(selected, c.x(960), c.y(449), c.units(42), c.units(510), primary, Align::Center);
+    text(current, c.x(960), c.y(506), c.units(20), c.units(510), secondary, Align::Center);
+    if (demanding)
+        text("This quality may stutter", c.x(960), c.y(548), c.units(18), c.units(510), accent, Align::Center);
+    text("Up / Down to choose  |  OK to apply", c.x(960), c.y(595),
+         c.units(19), c.units(510), primary, Align::Center);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
 }

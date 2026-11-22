@@ -130,6 +130,10 @@ void DirectClip::pause(bool value) {
     requested_pause_ = value;
 }
 bool DirectClip::remote(Action action, Media &media) {
+    if (quality_remote(action)) {
+        media.redraw();
+        return true;
+    }
     if (action == Action::SeekRelease) {
         if (scrub_commit_at_) scrub_commit_at_ = now_ns() + 180 * ns_per_ms;
         return true;
@@ -189,15 +193,63 @@ bool DirectClip::remote(Action action, Media &media) {
     return true;
 }
 
-void DirectClip::draw_controls(Shell &shell) const {
+bool DirectClip::quality_remote(Action action) {
+    if (action == Action::None || action == Action::SeekRelease) return false;
+    if (quality_index_ < 0 && action != Action::Up) return false;
+    if (quality_index_ >= 0 && action == Action::Back) {
+        quality_index_ = -1;
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(requests_);
+    if (!authorized_clip_ || start_requested_ || !playing_ || scrub_seconds_ >= 0) return false;
+    if (loading_ && quality_index_ < 0) return false;
+    controls_until_ = now_ns() + 4 * ns_per_second;
+    if (quality_index_ < 0) {
+        if (duration_ms_ <= 0 || rendition_heights_.size() < 2) return true;
+        quality_choices_ = rendition_heights_;
+        quality_choices_.insert(quality_choices_.begin(), 0);
+        const auto selected = std::find(quality_choices_.begin(), quality_choices_.end(), quality_height_);
+        quality_index_ = selected == quality_choices_.end() ? 0 : int(selected - quality_choices_.begin());
+    } else if (action == Action::Select) {
+        const int selected = quality_choices_[quality_index_];
+        quality_index_ = -1;
+        if (selected != quality_height_) {
+            next_quality_height_ = selected;
+            requested_position_ = std::max(0, position_ms_.load()) / 1000.0;
+            reopen_input_ = start_requested_ = true;
+            fprintf(stderr, "[direct] quality requested height=%d at %.2f s\n", selected, requested_position_);
+        }
+    } else if (action == Action::Up || action == Action::Down) {
+        const int count = int(quality_choices_.size());
+        quality_index_ = (quality_index_ + (action == Action::Down ? 1 : count - 1)) % count;
+    } else {
+        // Keep normal seek actions disabled while the quality picker has focus.
+        return true;
+    }
+    return true;
+}
+
+void DirectClip::draw_controls(Shell &shell, const Media &media) const {
+    if (!loading_ && playing_ && !paused_ && quality_index_ < 0 &&
+        scrub_seconds_ < 0 && now_ns() >= controls_until_) return;
+    const int width = media.video_width(), height = media.video_height();
+    const std::string resolution = width > 0 ? std::to_string(width) + " x " + std::to_string(height) : "";
+    if (quality_index_ >= 0) {
+        const int selection = quality_choices_[quality_index_];
+        shell.playback_quality(selection > 0 ? std::to_string(selection) + "p" : "Auto",
+                               resolution.empty() ? "" : "Playing " + resolution, selection >= 720);
+        return;
+    }
     if (loading_) shell.playback_loader();
     if (scrub_seconds_ >= 0) {
         const int duration = duration_ms_ > 0 ? duration_ms_.load() / 1000 : loading_duration_;
-        shell.playback_controls(position_ms_ / 1000, duration, true, scrub_seconds_, !scrub_commit_at_);
+        shell.playback_controls(position_ms_ / 1000, duration, true, scrub_seconds_, !scrub_commit_at_, resolution);
     } else if (loading_ && loading_target_ >= 0 && loading_duration_ > 0) {
         shell.playback_controls(loading_target_, loading_duration_, false);
     } else if (playing_ && !loading_ && (paused_ || now_ns() < controls_until_)) {
-        shell.playback_controls(position_ms_ / 1000, duration_ms_ / 1000, paused_);
+        const std::string label = multiple_renditions_ && duration_ms_ > 0 ?
+            resolution + "  |  UP: Quality" : resolution;
+        shell.playback_controls(position_ms_ / 1000, duration_ms_ / 1000, paused_, -1, false, label);
     }
 }
 
@@ -253,7 +305,13 @@ bool DirectClip::load_playlist(const std::string &url, std::string &resolved) {
     }
     avio_closep(&network);
     if (count != AVERROR_EOF || playlist_text_.compare(0, 7, "#EXTM3U") != 0) return false;
-    const auto filtered = select_hls_rendition(playlist_text_);
+    std::vector<int> heights;
+    const auto filtered = select_hls_rendition(playlist_text_, quality_height_, &heights);
+    {
+        std::lock_guard<std::mutex> lock(requests_);
+        multiple_renditions_ = heights.size() >= 2;
+        rendition_heights_ = std::move(heights);
+    }
     if (filtered != playlist_text_) fprintf(stderr, "[direct] selected one H.264 variant before opening segments\n");
     playlist_text_ = filtered;
 
@@ -468,11 +526,17 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
             next_loader_draw_ = 0;
         }
         join(!stop_requested && !new_clip && !reopen);
+        quality_index_ = -1;
         if (stop_requested || new_clip) {
+            next_quality_height_ = 0;
+            std::lock_guard<std::mutex> lock(requests_);
+            rendition_heights_.clear();
+            multiple_renditions_ = false;
             network_retries_ = 0;
             scrub_seconds_ = -1;
             scrub_commit_at_ = 0;
         }
+        quality_height_ = next_quality_height_;
         media.close();
         decoder.reset();
         playing_ = paused_ = false;
@@ -630,6 +694,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
                 feeds_.load(), media.frames.load(), audio_feeds_.load());
         const bool playback_failed = failed_ || media.failed;
         join();
+        quality_index_ = -1;
         loading_ = false;
         media.close();
         decoder.reset();

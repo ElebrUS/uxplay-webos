@@ -186,6 +186,8 @@ void Media::set_playback_clock(int64_t pts_ns) {
     impl_->playback_pts = pts_ns;
     impl_->clock_active = true;
 }
+int Media::video_width() const { return impl_->texture ? impl_->width : 0; }
+int Media::video_height() const { return impl_->texture ? impl_->height : 0; }
 
 bool Media::open_decoder(int width, int height, bool audio, int rate, bool buffered) {
     close();

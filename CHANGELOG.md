@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.8]
+
+- Show decoded video resolution in the Safari playback controls.
+- Use the remote to switch between Auto and resolutions in seekable HLS streams.
+
 ## [0.3.7]
 
 - Retry empty or prematurely ended Safari streams and distinguish them from normal completion.

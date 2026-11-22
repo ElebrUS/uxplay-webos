@@ -27,4 +27,11 @@ int main() {
     assert(select_hls_rendition(master +
         "#EXT-X-STREAM-INF:RESOLUTION=854x480,FRAME-RATE=59.94\nfast.m3u8\n")
         .find("\nvideo/360.m3u8\n") != std::string::npos);
+    std::vector<int> heights;
+    const auto manual = select_hls_rendition(mixed_rates, 720, &heights);
+    assert((heights == std::vector<int>{360, 480, 720}));
+    assert(manual.find("\n720.m3u8\n") != std::string::npos);
+    assert(manual.find("audio/main.m3u8") != std::string::npos);
+    assert(select_hls_rendition(mixed_rates, 1080).find("\n480-light.m3u8\n") != std::string::npos);
+    assert(select_hls_rendition(media, 720, &heights) == media && heights.empty());
 }

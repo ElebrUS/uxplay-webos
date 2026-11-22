@@ -16,6 +16,8 @@ public:
     bool open_clip(int width, int height, bool audio);
     void show_frames_from(int64_t pts_ns);
     void set_playback_clock(int64_t pts_ns);
+    int video_width() const;
+    int video_height() const;
     void set_overlay(std::function<void()> overlay);
     void redraw();
     void begin_loading(bool preserve_frame);

@@ -56,7 +56,7 @@ int main() {
     auto finish=[&](){ clear_playback(); receiver.disconnect(); };
 #ifdef DIRECT_EXPERIMENT
     bool direct_active = false;
-    media.set_overlay([&]() { direct.draw_controls(shell); });
+    media.set_overlay([&]() { direct.draw_controls(shell, media); });
     auto start_direct = [&]() {
         clear_playback();
         receiver.clear();
