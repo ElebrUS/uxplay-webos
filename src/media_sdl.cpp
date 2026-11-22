@@ -1,4 +1,7 @@
 #include "media.h"
+#ifdef WEBOS14_LGNC
+#include "media_lgnc.h"
+#endif
 #include <SDL.h>
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -7,6 +10,7 @@ extern "C" {
 #include <array>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <limits>
@@ -20,6 +24,7 @@ struct Media::Impl {
     SDL_Texture *loading_texture = nullptr;
     AVFrame *last_frame = nullptr;
     bool loading = false;
+    bool hold_hardware_frame = false;
     double loading_aspect = 1;
     std::function<void()> overlay;
     AVCodecContext *decoder = nullptr;
@@ -38,6 +43,17 @@ struct Media::Impl {
     std::array<uint8_t, 44100 * 4 / 5> pcm{};
     size_t audio_read = 0;
     size_t audio_size = 0;
+#ifdef WEBOS14_LGNC
+    LgncVideo hardware;
+#endif
+
+    bool hardware_video() const {
+#ifdef WEBOS14_LGNC
+        return hardware.opened();
+#else
+        return false;
+#endif
+    }
 
     static void audio_callback(void *context, Uint8 *output, int size) {
         auto &self = *static_cast<Impl *>(context);
@@ -48,6 +64,22 @@ struct Media::Impl {
         std::memcpy(output + first, self.pcm.data(), count - first);
         self.audio_read = (self.audio_read + count) % self.pcm.size();
         self.audio_size -= count;
+    }
+
+    void open_audio(bool enabled, int rate) {
+        if (!enabled) return;
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+            SDL_AudioSpec spec{};
+            spec.freq = rate;
+            spec.format = AUDIO_S16LSB;
+            spec.channels = 2;
+            spec.samples = 512;
+            spec.callback = audio_callback;
+            spec.userdata = this;
+            audio = SDL_OpenAudioDevice(nullptr, 0, &spec, nullptr, 0);
+            if (audio) SDL_PauseAudioDevice(audio, 0);
+        }
+        if (!audio) std::fprintf(stderr, "[audio] SDL unavailable: %s\n", SDL_GetError());
     }
 
     int upload() {
@@ -100,7 +132,7 @@ struct Media::Impl {
 
     bool redraw() {
         SDL_Texture *picture = loading ? loading_texture : texture;
-        if (!picture && !loading) return false;
+        if (!picture && !loading && !hardware_video()) return false;
         int output_width, output_height;
         if (SDL_GetRendererOutputSize(renderer, &output_width, &output_height) != 0 ||
             output_width <= 0 || output_height <= 0) return false;
@@ -110,7 +142,9 @@ struct Media::Impl {
         const SDL_Rect target = {(output_width - fitted_width) / 2, (output_height - fitted_height) / 2,
                                  fitted_width, fitted_height};
         if (!picture || fitted_width != output_width || fitted_height != output_height) {
-            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+            const bool transparent = !picture && hardware_video() && (!loading || hold_hardware_frame);
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, transparent ? 0 : 255);
             if (SDL_RenderClear(renderer) != 0) return false;
         }
         if (picture && SDL_RenderCopy(renderer, picture, nullptr, &target) != 0) return false;
@@ -127,6 +161,7 @@ void Media::begin_loading(bool preserve_frame) {
     auto &state = *impl_;
     if (!state.loading) {
         state.loading = true;
+        state.hold_hardware_frame = preserve_frame && hardware_video() && frames > 0;
         state.loading_aspect = state.aspect;
         const AVFrame *frame = state.last_frame;
         if (preserve_frame && frame && frame->data[0]) {
@@ -170,6 +205,7 @@ void Media::end_loading() {
     if (state.loading_texture) SDL_DestroyTexture(state.loading_texture);
     state.loading_texture = nullptr;
     state.loading = false;
+    state.hold_hardware_frame = false;
 }
 Media::~Media() { end_loading(); close(); delete impl_; }
 
@@ -177,7 +213,22 @@ bool Media::open(const char *, int width, int height, bool audio, int rate) {
     return open_decoder(width, height, audio, rate, false);
 }
 
-bool Media::open_clip(int width, int height, bool audio) {
+bool Media::open_clip(int width, int height, bool audio, const char *hardware_app_id) {
+#ifdef WEBOS14_LGNC
+    if (hardware_app_id && width > 0 && height > 0) {
+        close();
+        auto &state = *impl_;
+        if (state.hardware.open(hardware_app_id, width, height)) {
+            state.width = width;
+            state.height = height;
+            state.open_audio(audio, 44100);
+            ready = playing = true;
+            return true;
+        }
+    }
+#else
+    (void)hardware_app_id;
+#endif
     return open_decoder(width, height, audio, 44100, true);
 }
 
@@ -186,8 +237,17 @@ void Media::set_playback_clock(int64_t pts_ns) {
     impl_->playback_pts = pts_ns;
     impl_->clock_active = true;
 }
-int Media::video_width() const { return impl_->texture ? impl_->width : 0; }
-int Media::video_height() const { return impl_->texture ? impl_->height : 0; }
+bool Media::hardware_video() const { return impl_->hardware_video(); }
+bool Media::hardware_enabled() const {
+#ifdef WEBOS14_LGNC
+    const char *setting = std::getenv("UXPLAY_LGNC");
+    return !setting || std::strcmp(setting, "0") != 0;
+#else
+    return false;
+#endif
+}
+int Media::video_width() const { return impl_->texture || (hardware_video() && frames) ? impl_->width : 0; }
+int Media::video_height() const { return impl_->texture || (hardware_video() && frames) ? impl_->height : 0; }
 
 bool Media::open_decoder(int width, int height, bool audio, int rate, bool buffered) {
     close();
@@ -211,18 +271,7 @@ bool Media::open_decoder(int width, int height, bool audio, int rate, bool buffe
         close();
         return false;
     }
-    if (audio && SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-        SDL_AudioSpec spec{};
-        spec.freq = rate;
-        spec.format = AUDIO_S16LSB;
-        spec.channels = 2;
-        spec.samples = 512;
-        spec.callback = Impl::audio_callback;
-        spec.userdata = impl_;
-        state.audio = SDL_OpenAudioDevice(nullptr, 0, &spec, nullptr, 0);
-        if (state.audio) SDL_PauseAudioDevice(state.audio, 0);
-    }
-    if (audio && !state.audio) std::fprintf(stderr, "[audio] SDL unavailable: %s\n", SDL_GetError());
+    state.open_audio(audio, rate);
     ready = playing = true;
     return true;
 }
@@ -247,6 +296,14 @@ FeedResult Media::feed(const void *data, size_t size, int64_t pts_ns, bool video
         return FeedResult::Accepted;
     }
 
+#ifdef WEBOS14_LGNC
+    if (hardware_video()) {
+        const auto result = state.hardware.feed(data, size);
+        if (result == FeedResult::Accepted && present_video && pts_ns >= state.first_visible_pts)
+            ++frames;
+        return result;
+    }
+#endif
     if (av_new_packet(state.packet, int(size)) < 0) return FeedResult::Error;
     std::memcpy(state.packet->data, data, size);
     state.packet->pts = pts_ns;
@@ -295,6 +352,10 @@ void Media::pause(bool paused) {
 }
 void Media::close() {
     auto &state = *impl_;
+#ifdef WEBOS14_LGNC
+    state.hardware.close();
+#endif
+    state.hold_hardware_frame = false;
     if (state.audio) SDL_CloseAudioDevice(state.audio);
     state.audio = 0;
     state.audio_size = state.audio_read = 0;

@@ -26,7 +26,8 @@ public:
     void seek(double position);
     void pause(bool paused);
     void stop();
-    bool tick(Media &media, AudioDecoder &decoder, Shell &shell, const std::function<void()> &before_start,
+    bool tick(Media &media, AudioDecoder &decoder, Shell &shell, const char *app_id,
+              const std::function<void()> &before_start,
               const std::function<void(const char *)> &show_status);
     bool remote(Action action, Media &media);
     void draw_controls(Shell &shell, const Media &media) const;
@@ -80,6 +81,11 @@ private:
     bool requested_pause_ = false;
     bool playing_ = false;
     bool paused_ = false;
+    bool hardware_failed_ = false;
+    int64_t hardware_retry_since_ = 0;
+    int64_t next_hardware_draw_ = 0;
+    int64_t hardware_drain_until_ = 0;
+    bool hardware_overlay_visible_ = false;
     double requested_position_ = 0;
     bool loading_ = false;
     std::atomic<bool> rebuffering_{false};
@@ -103,6 +109,7 @@ private:
     std::atomic<int> duration_ms_{-1};
     std::atomic<int> position_ms_{-1};
     std::atomic<bool> audio_{false};
+    std::atomic<bool> hardware_eligible_{false};
     std::atomic<unsigned> feeds_{0};
     std::atomic<unsigned> audio_feeds_{0};
 };

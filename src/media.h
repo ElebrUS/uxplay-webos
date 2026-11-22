@@ -13,7 +13,9 @@ class Media {
 public:
 #ifdef WEBOS14
     explicit Media(SDL_Renderer *renderer);
-    bool open_clip(int width, int height, bool audio);
+    bool open_clip(int width, int height, bool audio, const char *hardware_app_id = nullptr);
+    bool hardware_enabled() const;
+    bool hardware_video() const;
     void show_frames_from(int64_t pts_ns);
     void set_playback_clock(int64_t pts_ns);
     int video_width() const;

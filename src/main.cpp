@@ -9,10 +9,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <fstream>
 #include <sys/stat.h>
 
 int main() {
     umask(0077);start_log("uxplay.log");
+    const char *app_id = getenv("APPID");
+    if (!app_id) app_id = "com.github.danlflh.uxplaywebos";
+#ifdef DIRECT_EXPERIMENT
+    // Optional application-local configuration for a native LGNC test package.
+    std::string experimental_id;
+    std::ifstream experimental(app_directory() + "/experimental-lgnc.txt");
+    if (std::getline(experimental, experimental_id) && !experimental_id.empty() &&
+        experimental_id.size() < 128 &&
+        experimental_id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.") == std::string::npos) {
+        app_id = experimental_id.c_str();
+        setenv("UXPLAY_NAME", "UxPlay Hardware Lab", 1);
+    }
+#endif
     Shell shell;if(!shell.open())return 1;
     shell.screen("Starting AirPlay receiver","");
 #ifdef DIRECT_EXPERIMENT
@@ -27,7 +41,6 @@ int main() {
         while(shell.pump())SDL_Delay(50);
         return 1;
     }
-    const char *app_id=getenv("APPID");if(!app_id)app_id="com.github.danlflh.uxplaywebos";
 #ifdef WEBOS14
     Media media(shell.renderer);
 #else
@@ -72,7 +85,7 @@ int main() {
         const bool handled = direct_active && direct.remote(action, media);
         const bool stop_direct = direct_active && action == Action::Back && !handled;
         if (stop_direct) direct.stop();
-        direct_active = direct.tick(media, decoder, shell, start_direct,
+        direct_active = direct.tick(media, decoder, shell, app_id, start_direct,
                                     [&](const char *status) { receiver.show(status); });
         if (direct_active || stop_direct || handled) {
             receiver.reset.exchange(false);

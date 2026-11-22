@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.9]
+
+- Use the LGNC hardware video plane for eligible direct 720p and 1080p H.264 on webOS 1.4.
+- Keep audio on SDL and fall back to FFmpeg if the hardware decoder rejects or stalls on the stream.
+- Show the hardware video indicator next to the current resolution.
+
 ## [0.3.8]
 
 - Show decoded video resolution in the Safari playback controls.

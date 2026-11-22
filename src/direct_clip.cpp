@@ -233,7 +233,8 @@ void DirectClip::draw_controls(Shell &shell, const Media &media) const {
     if (!loading_ && playing_ && !paused_ && quality_index_ < 0 &&
         scrub_seconds_ < 0 && now_ns() >= controls_until_) return;
     const int width = media.video_width(), height = media.video_height();
-    const std::string resolution = width > 0 ? std::to_string(width) + " x " + std::to_string(height) : "";
+    const std::string resolution = width > 0 ? std::to_string(width) + " x " + std::to_string(height) +
+        (media.hardware_video() ? "  HW" : "") : "";
     if (quality_index_ >= 0) {
         const int selection = quality_choices_[quality_index_];
         shell.playback_quality(selection > 0 ? std::to_string(selection) + "p" : "Auto",
@@ -400,6 +401,11 @@ void DirectClip::read(double start, std::string source) {
         }
         const AVCodecParameters *video_params = input->streams[video]->codecpar;
         if (video_params->codec_id != AV_CODEC_ID_H264) return false;
+        const int profile = video_params->profile;
+        hardware_eligible_ = input->duration > 0 && video_params->height >= 720 &&
+            (video_params->format == AV_PIX_FMT_YUV420P || video_params->format == AV_PIX_FMT_YUVJ420P) &&
+            (profile == AV_PROFILE_H264_BASELINE || profile == AV_PROFILE_H264_CONSTRAINED_BASELINE ||
+             profile == AV_PROFILE_H264_MAIN || profile == AV_PROFILE_H264_HIGH);
         const AVCodecParameters *audio_params = audio >= 0 ? input->streams[audio]->codecpar : nullptr;
         audio_ = audio_params && audio_params->codec_id == AV_CODEC_ID_AAC &&
                  (audio_params->extradata_size == 0 ||
@@ -484,7 +490,8 @@ void DirectClip::read(double start, std::string source) {
     finished_ = true;
 }
 
-bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const std::function<void()> &before_start,
+bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const char *app_id,
+                      const std::function<void()> &before_start,
                       const std::function<void(const char *)> &show_status) {
     if (scrub_seconds_ >= 0 && scrub_commit_at_ && now_ns() >= scrub_commit_at_) {
         const int target = scrub_seconds_;
@@ -528,6 +535,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         join(!stop_requested && !new_clip && !reopen);
         quality_index_ = -1;
         if (stop_requested || new_clip) {
+            hardware_failed_ = false;
             next_quality_height_ = 0;
             std::lock_guard<std::mutex> lock(requests_);
             rendition_heights_.clear();
@@ -542,6 +550,10 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         playing_ = paused_ = false;
         rebuffering_ = false;
         empty_since_ = 0;
+        hardware_retry_since_ = 0;
+        next_hardware_draw_ = 0;
+        hardware_drain_until_ = 0;
+        hardware_overlay_visible_ = false;
         if (stop_requested) return false;
         preview_at_ = seek > 0 ? int64_t(seek * ns_per_second) : (pause ? 0 : -1);
         controls_until_ = now_ns() + 4 * ns_per_second;
@@ -559,13 +571,27 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
     }
     if (!playing_ && ready_) {
         const bool audio_ready = audio_ && decoder.configure_aac(audio_config_.data(), audio_config_.size());
-        if (media.open_clip(width_, height_, audio_ready)) {
+        const bool attempt_hardware = media.hardware_enabled() && hardware_eligible_ && !hardware_failed_;
+        if (media.open_clip(width_, height_, audio_ready, attempt_hardware ? app_id : nullptr)) {
+            if (attempt_hardware && !media.hardware_video()) {
+                hardware_failed_ = true;
+                fprintf(stderr, "[direct] LGNC unavailable, using software\n");
+            }
             if (preview_at_ >= 0) media.show_frames_from(preview_at_);
             playing_ = true;
             origin_ = 0;
             fprintf(stderr, "[direct] video open %dx%d audio=%d\n", width_.load(), height_.load(), int(audio_));
         } else {
             stop();
+        }
+    }
+    if (media.hardware_video() && !loading_) {
+        const int64_t now = now_ns();
+        const bool show_overlay = paused_ || quality_index_ >= 0 || scrub_seconds_ >= 0 || now < controls_until_;
+        if ((show_overlay && now >= next_hardware_draw_) || (hardware_overlay_visible_ && !show_overlay)) {
+            media.redraw();
+            next_hardware_draw_ = now + 120 * ns_per_ms;
+            hardware_overlay_visible_ = show_overlay;
         }
     }
     {
@@ -633,11 +659,31 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
             sample = std::move(queue_.front());
             queue_.pop_front();
         }
-        available_.notify_one();
         if (sample.video) {
             if (preview_at_ < 0) media.set_playback_clock(now_ns() - origin_);
-            if (media.feed(sample.data.data(), sample.data.size(), sample.pts, true) ==
-                FeedResult::Error) {
+            const auto result = media.feed(sample.data.data(), sample.data.size(), sample.pts, true);
+            if (result == FeedResult::Retry) {
+                const int64_t now = now_ns();
+                if (hardware_retry_since_ == 0) hardware_retry_since_ = now;
+                if (now - hardware_retry_since_ < 750 * ns_per_ms) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    queued_bytes_ += sample.data.size();
+                    queue_.push_front(std::move(sample));
+                    break;
+                }
+            }
+            hardware_retry_since_ = 0;
+            if (result != FeedResult::Accepted && media.hardware_video()) {
+                std::lock_guard<std::mutex> lock(requests_);
+                if (authorized_clip_ && !start_requested_ && !stop_requested_) {
+                    hardware_failed_ = true;
+                    if (position_ms_ >= 0) requested_position_ = position_ms_ / 1000.0;
+                    reopen_input_ = start_requested_ = true;
+                    fprintf(stderr, "[direct] recovering with software at %.2f s\n", requested_position_);
+                }
+                return true;
+            }
+            if (result == FeedResult::Error) {
                 stop();
                 break;
             }
@@ -652,6 +698,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
                 if (media.feed(pcm.data(), pcm.size(), sample.pts, false) == FeedResult::Accepted) ++audio_feeds_;
             }
         }
+        available_.notify_one();
         position_ms_ = int(std::max(int64_t(0), sample.decode_at) / ns_per_ms);
         if (sample.video && preview_at_ >= 0 && media.frames > 0) {
             preview_at_ = -1;
@@ -667,6 +714,11 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const s
         }
     }
     if (finished_ && empty) {
+        if (media.hardware_video() && media.frames > 0) {
+            const int64_t now = now_ns();
+            if (hardware_drain_until_ == 0) hardware_drain_until_ = now + 180 * ns_per_ms;
+            if (now < hardware_drain_until_) return true;
+        }
         const int position = position_ms_;
         media.end_loading();
         media.eos();
