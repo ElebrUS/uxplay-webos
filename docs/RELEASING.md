@@ -1,22 +1,17 @@
-# Releasing UxPlay webOS
+# Releasing UxPlay webOS Legacy
 
-## Before tagging
+The fork is developed on `webos-1.4-port`. GitHub Actions validates changes and builds an ARMv7 IPK and its corresponding source archive on Apple Silicon. Branch pushes and pull requests produce an Actions artifact. Releases require an explicit version tag pushed to [ElebrUS/uxplay-webos](https://github.com/ElebrUS/uxplay-webos).
 
-1. Start from a clean checkout on `main`; confirm no generated files are tracked.
-2. Set the release version only in `packaging/appinfo.json`. The Git tag must be `v<version>` and the GitHub release title must be `UxPlay webOS v<version>`.
-3. Update `CHANGELOG.md`. During `0.x`, use patch versions for fixes and minor versions for new capabilities. Reserve `1.0.0` for broader stability and compatibility.
-4. Run `python3 tools/validate-metadata.py` and `tools/test.sh`.
-5. Build from the clean checkout with `tools/build.sh`, then create corresponding source with `tools/source-package.py`.
-6. Verify the staged ELF with `tools/verify-elf.py build/app`: ARM32 ABI, GLIBC <= 2.19, and the app-local `libstdc++.so.6` must resolve the required C++ symbols.
-7. Inspect both archives for SSH keys, logs, personal IP addresses, and pairing data. Confirm the output names are `com.github.danlflh.uxplaywebos_<version>_arm.ipk` and `uxplay-webos-<version>-source.tar.gz`.
-8. On the validated TV, install the new identity after removing any old development-ID build. Confirm English UI, discovery, PIN, video, audio, rotation, disconnect/reconnect, and relaunch. Record limitations that remain.
+## Prepare a release
+
+1. Set the version in `packaging/appinfo.json` and add the matching section to `CHANGELOG.md`.
+2. Run `python3 tools/validate-metadata.py`, `tools/test.sh`, and `tools/test-software.sh`.
+3. On macOS ARM64, run `tools/build.sh` and `python3 tools/source-package.py`. The build runs ELF compatibility checks before packaging.
+4. Verify the IPK on compatible hardware when available. Record which firmware and playback modes were exercised and document any gaps.
+5. Push the release commit to the fork and check the branch workflow.
 
 ## Publish
 
-1. Create a clean initial/release commit and an annotated `v<version>` tag only after all checks pass.
-2. Push `main` and the tag to `github.com/danlflh/uxplay-webos`.
-3. Create a normal GitHub release titled `UxPlay webOS v<version>` (not a pre-release), clearly describing it as experimental.
-4. Attach the IPK, source archive, and a `SHA256SUMS` file generated from those two artifacts.
-5. Use the matching changelog section as release notes and include validated hardware/firmware plus known limitations.
+Create and push an annotated tag in the form `v<version>` for the release commit. The tag must match the package version exactly. After the host tests and ARM build succeed, GitHub Actions creates the release from the matching changelog section and attaches the IPK, corresponding source archive, and `SHA256SUMS`.
 
-This project does not create a webOS Brew catalog manifest or submission in this release process.
+This workflow publishes GitHub Releases. It does not submit a webOS Brew catalog entry or install the package on a TV.

@@ -46,6 +46,7 @@ private:
     void close_input();
     bool load_playlist(const std::string &url, std::string &resolved);
     bool quality_remote(Action action);
+    bool retry_input(bool no_picture, int position);
     void recover_hardware(const Media &media, bool starfish, const char *reason);
     FeedResult feed_sample(Media &media, const Sample &sample);
     bool enqueue(Sample sample);
@@ -73,6 +74,7 @@ private:
     std::atomic<bool> finished_{false};
     std::atomic<bool> failed_{false};
     std::atomic<bool> read_error_{false};
+    std::atomic<int> input_error_{0};
     std::atomic<bool> ready_{false};
     std::atomic<int64_t> deadline_{0};
     mutable std::mutex requests_;
@@ -89,6 +91,7 @@ private:
     unsigned starfish_retries_ = 0;
     double starfish_fault_position_ = -1;
     bool forward_keyframe_ = false;
+    bool active_forward_keyframe_ = false;
     bool prefer_hardware_hls_ = false;
     std::atomic<bool> promoted_hls_{false};
     int64_t hardware_retry_since_ = 0;
@@ -106,6 +109,7 @@ private:
     bool loading_ = false;
     std::atomic<bool> rebuffering_{false};
     int64_t empty_since_ = 0;
+    int64_t buffering_started_ = 0;
     unsigned network_retries_ = 0;
     int64_t next_loader_draw_ = 0;
     int64_t controls_until_ = 0;
@@ -116,6 +120,8 @@ private:
     int64_t hold_started_ = 0;
     int64_t last_scrub_step_ = 0;
     int64_t loading_started_ = 0;
+    std::atomic<int64_t> first_video_queued_at_{0};
+    int64_t target_submitted_at_ = 0;
     int loading_target_ = -1;
     int loading_duration_ = 0;
     int64_t preview_at_ = -1;

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.10]
+
+- Separate stream I/O retries from Starfish recovery and keep the seek target when reconnecting.
+- Report certificate verification, timeouts, and unsupported sources separately.
+- Keep the last requested seek and preserve pause during recovery.
+- Log decoder recovery, time to first frame, and input buffering.
+- Add bilingual documentation, interface captures, and build and release automation.
+
 ## [0.3.9]
 
 - Use the LGNC hardware video plane for eligible direct 720p and 1080p H.264 on webOS 1.4.

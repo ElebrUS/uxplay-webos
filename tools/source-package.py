@@ -27,7 +27,7 @@ def main():
             subprocess.run(['git', '-C', str(ROOT/'vendor/uxplay'), 'archive', '--format=tar',
                             '--prefix=uxplay/', lock['uxplay']['commit']], stdout=out, check=True)
     with tarfile.open(destination,'w:gz') as archive:
-        for name in ['src','tools','tests','packaging','docs','CMakeLists.txt','dependencies.lock.json','README.md','CHANGELOG.md','THIRD_PARTY.md','LICENSE','.github','.gitattributes']:
+        for name in ['src','tools','tests','packaging','docs','CMakeLists.txt','dependencies.lock.json','README.md','README.ru.md','CHANGELOG.md','THIRD_PARTY.md','LICENSE','.github','.gitattributes']:
             archive.add(ROOT/name,arcname='uxplay-webos/'+name,filter=lambda info:None if '__pycache__' in info.name or info.name.endswith('.pyc') else info)
         for name in ['openssl','libplist','ffmpeg','jitterentropy']:
             filename=lock[name]['archive']

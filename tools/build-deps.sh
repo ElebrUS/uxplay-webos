@@ -11,7 +11,8 @@ export CFLAGS="--sysroot=$sdk/arm-webos-linux-gnueabi/sysroot -O2 -fPIC"
 export CXXFLAGS="$CFLAGS -D_GLIBCXX_USE_CXX11_ABI=0"
 export LDFLAGS="--sysroot=$sdk/arm-webos-linux-gnueabi/sysroot"
 mkdir -p "$prefix" build/logs
-build_stamp="$(shasum -a 256 "$0" | cut -d ' ' -f 1)"
+ffmpeg_patch="$root/tools/patches/ffmpeg-tls-verify.patch"
+build_stamp="$(cat "$0" "$ffmpeg_patch" | shasum -a 256 | cut -d ' ' -f 1)"
 previous_stamp="$(cat "$prefix/build-config.sha256" 2>/dev/null || true)"
 if [ ! -f "$prefix/lib/libcrypto.a" ] || [ ! -f "$prefix/lib/libjitterentropy.a" ] ||
    ! grep -q libjitterentropy "$prefix/lib/pkgconfig/libcrypto.pc"; then
@@ -35,6 +36,9 @@ if [ ! -f "$prefix/lib/libplist-2.0.a" ]; then
 fi
 if [ "$build_stamp" != "$previous_stamp" ] || [ ! -f "$prefix/lib/libavformat.a" ]; then
     (cd .cache/ffmpeg-8.1.2
+     if ! patch -R -p1 --dry-run -f < "$ffmpeg_patch" >/dev/null 2>&1; then
+         patch -p1 -f < "$ffmpeg_patch"
+     fi
      export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
      export PKG_CONFIG_PATH=""
      make clean

@@ -1,12 +1,19 @@
-name: Validate
+name: CI and release
 
 on:
   push:
+    branches: [webos-1.4-port]
+    tags: ['v*']
   pull_request:
+    branches: [webos-1.4-port]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   host-tests:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Install host test dependencies
@@ -17,3 +24,74 @@ jobs:
         run: tools/test.sh
       - name: Test software playback and seeking
         run: tools/test-software.sh
+
+  armv7:
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check package version
+        id: version
+        shell: bash
+        run: |
+          python3 tools/validate-metadata.py
+          version=$(python3 -c 'import json; print(json.load(open("packaging/appinfo.json"))["version"])')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME must match package version v$version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install build tools
+        run: |
+          brew install cmake ninja pkgconf
+          npm install --global @webos-tools/cli@3.2.6
+      - name: Build ARMv7 IPK and corresponding source archive
+        env:
+          BUILD_JOBS: '3'
+        run: |
+          tools/build.sh
+          python3 tools/source-package.py
+      - name: Stage release files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p release
+          cp "dist/com.github.danlflh.uxplaywebos_${VERSION}_arm.ipk" "dist/uxplay-webos-${VERSION}-source.tar.gz" release/
+          cd release
+          shasum -a 256 *.ipk *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uxplay-webos-armv7
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'ElebrUS/uxplay-webos'
+    needs: [host-tests, armv7]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: uxplay-webos-armv7
+          path: release
+      - name: Publish the versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.armv7.outputs.version }}
+        run: |
+          awk -v heading="## [$VERSION]" '
+            $0 == heading { section = 1; next }
+            /^## / && section { exit }
+            section { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+          (cd release && sha256sum --check SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "UxPlay webOS v$VERSION" \
+            --notes-file release-notes.md release/*.ipk release/*.tar.gz release/SHA256SUMS

@@ -28,6 +28,8 @@ constexpr size_t max_queue_packets = 128;
 constexpr size_t max_queue_bytes = 8 * 1024 * 1024;
 constexpr int64_t rebuffer_delay = 120 * ns_per_ms;
 constexpr int64_t resume_buffer = 350 * ns_per_ms;
+// The bundled FFmpeg preserves certificate verification failures separately from EIO.
+constexpr int tls_verify_failed = FFERRTAG('X', '5', '0', '9');
 
 bool http_url(const std::string &url) {
     if (url.size() > 8192 || url.find_first_of(" \t\r\n\\") != std::string::npos) return false;
@@ -119,9 +121,11 @@ void DirectClip::seek(double position) {
     std::lock_guard<std::mutex> lock(requests_);
     if (!authorized_clip_ || (ready_ && duration_ms_ <= 0)) return;
     const int current_ms = position_ms_.load();
-    const double current = current_ms < 0 ? requested_position_ : current_ms / 1000.0;
-    if (std::fabs(current - position) < 1.5 ||
-        (current_ms < 5000 && std::fabs(requested_position_ - position) < 0.05)) return;
+    if (start_requested_ || current_ms < 0) {
+        if (std::fabs(requested_position_ - position) < 0.05) return;
+    } else if (std::fabs(current_ms / 1000.0 - position) < 1.5) {
+        return;
+    }
     fprintf(stderr, "[direct] seek %.2f seconds\n", position);
     requested_position_ = position;
     forward_keyframe_ = false;
@@ -294,6 +298,8 @@ void DirectClip::stop() {
     authorized_clip_ = false;
     stop_requested_ = true;
     start_requested_ = false;
+    interrupted_ = true;
+    available_.notify_all();
 }
 
 void DirectClip::join(bool keep_input) {
@@ -325,7 +331,10 @@ bool DirectClip::load_playlist(const std::string &url, std::string &resolved) {
     secure_http_options(&options);
     const int opened = avio_open2(&network, url.c_str(), AVIO_FLAG_READ, &input_->interrupt_callback, &options);
     av_dict_free(&options);
-    if (opened < 0) return false;
+    if (opened < 0) {
+        input_error_ = now_ns() >= deadline_ ? AVERROR(ETIMEDOUT) : opened;
+        return false;
+    }
 
     uint8_t *location = nullptr;
     if (av_opt_get(network, "location", AV_OPT_SEARCH_CHILDREN, &location) >= 0) {
@@ -340,7 +349,11 @@ bool DirectClip::load_playlist(const std::string &url, std::string &resolved) {
         playlist_text_.append(buffer, count);
     }
     avio_closep(&network);
-    if (count != AVERROR_EOF || playlist_text_.compare(0, 7, "#EXTM3U") != 0) return false;
+    if (count != AVERROR_EOF || playlist_text_.compare(0, 7, "#EXTM3U") != 0) {
+        input_error_ = now_ns() >= deadline_ ? AVERROR(ETIMEDOUT) :
+            (count < 0 && count != AVERROR_EOF ? count : AVERROR_INVALIDDATA);
+        return false;
+    }
     HlsSelection selection;
     const auto filtered = select_hls_rendition(playlist_text_, quality_height_, &selection, prefer_hardware_hls_);
     promoted_hls_ = selection.promoted_for_hardware;
@@ -409,6 +422,11 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
                 auto **args = options ? options : &defaults;
                 secure_http_options(args);
                 const int result = avio_open2(io, url, flags, &context->interrupt_callback, args);
+                if (result == tls_verify_failed) {
+                    auto &clip = *static_cast<DirectClip *>(context->interrupt_callback.opaque);
+                    clip.input_error_ = result;
+                    fprintf(stderr, "[direct] TLS certificate rejected while opening a media URL\n");
+                }
                 av_dict_free(&defaults);
                 return result;
             };
@@ -427,11 +445,21 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
             const int opened = avformat_open_input(&input_, resolved.c_str(), hls ? av_find_input_format("hls") : nullptr, &options);
             av_dict_free(&options);
             if (opened < 0) {
+                if (input_error_ != tls_verify_failed)
+                    input_error_ = now_ns() >= deadline_ ? AVERROR(ETIMEDOUT) : opened;
                 if (!interrupted_) fprintf(stderr, "[direct] open failed: %d\n", opened);
                 return false;
             }
-            if (avformat_find_stream_info(input_, nullptr) < 0 ||
-                input_->duration / 1000 >= std::numeric_limits<int>::max()) return false;
+            const int probe = avformat_find_stream_info(input_, nullptr);
+            if (probe < 0) {
+                if (input_error_ != tls_verify_failed)
+                    input_error_ = now_ns() >= deadline_ ? AVERROR(ETIMEDOUT) : probe;
+                return false;
+            }
+            if (input_->duration / 1000 >= std::numeric_limits<int>::max()) {
+                input_error_ = AVERROR_INVALIDDATA;
+                return false;
+            }
             fprintf(stderr, "[direct] opened container %s\n", input_->iformat->name);
         } else {
             fprintf(stderr, "[direct] reusing stream index for seek\n");
@@ -439,7 +467,10 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
         AVFormatContext *input = input_;
 
         const int video = video_stream(*input);
-        if (video < 0) return false;
+        if (video < 0) {
+            input_error_ = AVERROR_INVALIDDATA;
+            return false;
+        }
         const int audio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, video, nullptr, 0);
         for (unsigned i = 0; i < input->nb_streams; ++i) {
             if (int(i) != video && int(i) != audio) input->streams[i]->discard = AVDISCARD_ALL;
@@ -493,9 +524,13 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
             deadline_ = seek_started + timeout_ns;
             const int64_t target = av_rescale_q(input_start + int64_t(start * AV_TIME_BASE), AV_TIME_BASE_Q,
                                                 input->streams[video]->time_base);
-            if ((!forward_keyframe || av_seek_frame(input, video, target, 0) < 0) &&
-                av_seek_frame(input, video, target, AVSEEK_FLAG_BACKWARD) < 0)
+            int result = forward_keyframe ? av_seek_frame(input, video, target, 0) : AVERROR(ENOSYS);
+            if (result < 0 && result != tls_verify_failed)
+                result = av_seek_frame(input, video, target, AVSEEK_FLAG_BACKWARD);
+            if (result < 0) {
+                input_error_ = now_ns() >= deadline_ ? AVERROR(ETIMEDOUT) : result;
                 return false;
+            }
             if (hls_input_)
                 fprintf(stderr, "[direct] HLS demux seek ready after %.3f s\n", (now_ns() - seek_started) / 1e9);
         }
@@ -516,6 +551,7 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
             const int64_t pts = item.pts == AV_NOPTS_VALUE ?
                 decode_at : av_rescale_q(item.pts, time_base, nanoseconds) - origin;
             if (!is_video && pts < 0) return true;
+            if (is_video && first_video_queued_at_ == 0) first_video_queued_at_ = now_ns();
             return enqueue({std::vector<uint8_t>(item.data, item.data + item.size), decode_at, pts, is_video});
         };
         while (!interrupted_) {
@@ -525,6 +561,9 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
             if (result == AVERROR_EOF && !timed_out) return true;
             if (result < 0 || (packet->flags & AV_PKT_FLAG_CORRUPT)) {
                 read_error_ = !interrupted_;
+                if (input_error_ != tls_verify_failed)
+                    input_error_ = timed_out ? AVERROR(ETIMEDOUT) :
+                        (result < 0 ? result : AVERROR_INVALIDDATA);
                 return false;
             }
             if (packet->stream_index == video) {
@@ -545,14 +584,39 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
 
     bool success = false;
     for (int attempt = 0; attempt < 3 && !interrupted_; ++attempt) {
+        input_error_ = 0;
         success = demux();
         if (success) break;
         close_input();
-        if (ready_) break;
+        if (ready_ || input_error_ == tls_verify_failed) break;
     }
     if (!success && !interrupted_) fprintf(stderr, "[direct] media stream failed\n");
     failed_ = !success && !interrupted_;
     finished_ = true;
+}
+
+bool DirectClip::retry_input(bool no_picture, int position) {
+    std::lock_guard<std::mutex> lock(requests_);
+    if (!authorized_clip_ || start_requested_ || stop_requested_ || network_retries_ >= 2) return false;
+    const bool alternate_source = no_picture && !fallback_source_.empty();
+    const int error = input_error_;
+    // A range request may reach a different CDN node after reconnecting.
+    // Give a certificate failure during reading one fresh verified connection.
+    const bool terminal_tls_error = error == tls_verify_failed && (!read_error_ || network_retries_ != 0);
+    if (!alternate_source && (terminal_tls_error || error == AVERROR_INVALIDDATA)) return false;
+    if (promoted_hls_ && no_picture && error == 0) hardware_failed_ = true;
+    if (alternate_source) {
+        requested_source_ = std::move(fallback_source_);
+        fallback_source_.clear();
+        fprintf(stderr, "[direct] mapped MP4 had no video, trying original HLS\n");
+    }
+    if (!no_picture && position > 0) requested_position_ = position / 1000.0;
+    forward_keyframe_ = no_picture && active_forward_keyframe_;
+    reopen_input_ = start_requested_ = true;
+    ++network_retries_;
+    fprintf(stderr, "[direct] reconnecting at %.2f s (attempt %u)\n",
+            requested_position_, network_retries_);
+    return true;
 }
 
 void DirectClip::recover_hardware(const Media &media, bool starfish, const char *reason) {
@@ -582,9 +646,18 @@ void DirectClip::recover_hardware(const Media &media, bool starfish, const char 
         hardware_failed_ = true;
     }
     reopen_input_ = start_requested_ = true;
+    size_t queued_packets, queued_bytes;
+    {
+        std::lock_guard<std::mutex> queue_lock(mutex_);
+        queued_packets = queue_.size();
+        queued_bytes = queued_bytes_;
+    }
     fprintf(stderr, "[direct] recovering from %s at %.2f s (%s%s)\n",
             starfish ? "Starfish" : "LGNC", requested_position_, reason,
             forward_keyframe_ ? ", next keyframe" : "");
+    fprintf(stderr, "[direct] recovery snapshot displayed=%lld ms submitted=%d ms packets=%zu bytes=%zu feeds=%u\n",
+            static_cast<long long>(displayed < 0 ? -1 : displayed / ns_per_ms),
+            position_ms_.load(), queued_packets, queued_bytes, feeds_.load());
 }
 
 FeedResult DirectClip::feed_sample(Media &media, const Sample &sample) {
@@ -629,7 +702,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         start_requested_ = stop_requested_ = new_clip_ = reopen_input_ = false;
         forward_keyframe_ = false;
     }
-    if (start || (stop_requested && (playing_ || worker_.joinable()))) {
+    if (start || stop_requested) {
         if (playing_) {
             fprintf(stderr, "[direct] ended packets=%u frames=%u audio=%u\n",
                     feeds_.load(), media.frames.load(), audio_feeds_.load());
@@ -673,6 +746,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         playing_ = paused_ = false;
         rebuffering_ = false;
         empty_since_ = 0;
+        buffering_started_ = 0;
         hardware_retry_since_ = 0;
         next_hardware_draw_ = 0;
         hardware_drain_until_ = 0;
@@ -683,9 +757,14 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         hardware_overlay_visible_ = false;
         last_hardware_feed_ = max_hardware_gap_ = max_hardware_lateness_ = 0;
         if (stop_requested) return false;
+        active_forward_keyframe_ = forward_keyframe;
+        first_video_queued_at_ = 0;
+        target_submitted_at_ = 0;
         preview_at_ = seek > 0 ? int64_t(seek * ns_per_second) : (pause ? 0 : -1);
         controls_until_ = now_ns() + 4 * ns_per_second;
         before_start();
+        std::lock_guard<std::mutex> lock(requests_);
+        if (!authorized_clip_ || start_requested_ || stop_requested_) return true;
         interrupted_ = false;
         finished_ = failed_ = read_error_ = false;
         feeds_ = audio_feeds_ = 0;
@@ -743,11 +822,17 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
                 displayed >= 0 && last_video_pts_ >= 0 &&
                 displayed + 900 * ns_per_ms >= last_video_pts_ &&
                 last_video_pts_ / ns_per_ms + 500 >= duration_ms_;
-            if (!drained) {
+            const bool input_failed_before_video = finished_ && failed_ && read_error_ && feeds_ == 0;
+            if (!drained && !input_failed_before_video) {
                 recover_hardware(media, true, "pipeline reported an error");
                 return true;
             }
-            if (!starfish_tail_completed_) {
+            if (input_failed_before_video) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                queue_.clear();
+                queued_bytes_ = 0;
+            }
+            if (drained && !starfish_tail_completed_) {
                 starfish_tail_completed_ = true;
                 fprintf(stderr, "[direct] Starfish ended after all packets were submitted\n");
             }
@@ -777,6 +862,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
     if (playing_ && !paused_ && preview_at_ < 0 && origin_ != 0 && !finished_) {
         const int64_t now = now_ns();
         bool start_buffering = false, resume = false;
+        int64_t buffered_ns = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (queue_.empty()) {
@@ -784,7 +870,8 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
                 start_buffering = !rebuffering_ && now - empty_since_ >= rebuffer_delay;
             } else {
                 empty_since_ = 0;
-                const bool enough = queue_.back().decode_at - queue_.front().decode_at >= resume_buffer ||
+                buffered_ns = queue_.back().decode_at - queue_.front().decode_at;
+                const bool enough = buffered_ns >= resume_buffer ||
                     queue_.size() == max_queue_packets || queued_bytes_ > max_queue_bytes - max_packet_size;
                 resume = rebuffering_ && enough;
                 if (resume) origin_ = now - queue_.front().decode_at;
@@ -793,15 +880,20 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         if (start_buffering) {
             last_hardware_feed_ = 0;
             rebuffering_ = loading_ = true;
+            buffering_started_ = empty_since_;
             loading_target_ = -1;
             media.pause(true);
             media.begin_loading(true);
-            fprintf(stderr, "[direct] buffering\n");
+            fprintf(stderr, "[direct] buffering at %d ms, backend=%s height=%d\n",
+                    position_ms_.load(), media.starfish_video() ? "Starfish" :
+                    media.hardware_video() ? "LGNC" : "software", height_.load());
         } else if (resume) {
             rebuffering_ = loading_ = false;
             media.end_loading();
             media.pause(false);
-            fprintf(stderr, "[direct] resumed\n");
+            fprintf(stderr, "[direct] resumed after %lld ms, queued media=%lld ms\n",
+                    static_cast<long long>((now - buffering_started_) / ns_per_ms),
+                    static_cast<long long>(buffered_ns / ns_per_ms));
         }
     }
     if (rebuffering_ && finished_ && !paused_) {
@@ -856,6 +948,8 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             if (starfish_audio) ++audio_feeds_;
         }
         if (sample.video) {
+            if (loading_ && !target_submitted_at_ && (preview_at_ < 0 || sample.pts >= preview_at_))
+                target_submitted_at_ = submit_at;
             last_video_pts_ = std::max(last_video_pts_, sample.pts);
             if (media.hardware_video() && preview_at_ < 0) {
                 if (last_hardware_feed_ != 0)
@@ -897,6 +991,14 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             media.end_loading();
             media.redraw();
             fprintf(stderr, "[direct] first frame ready after %.2f s\n", (now_ns() - loading_started_) / 1e9);
+            const int64_t demuxed = first_video_queued_at_;
+            if (demuxed && target_submitted_at_) {
+                fprintf(stderr, "[direct] timing backend=%s demux=%lld ms preroll=%lld ms present=%lld ms\n",
+                        media.starfish_video() ? "Starfish" : media.hardware_video() ? "LGNC" : "software",
+                        static_cast<long long>((demuxed - loading_started_) / ns_per_ms),
+                        static_cast<long long>((target_submitted_at_ - demuxed) / ns_per_ms),
+                        static_cast<long long>((now_ns() - target_submitted_at_) / ns_per_ms));
+            }
         }
     }
     if (finished_ && empty) {
@@ -926,33 +1028,28 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         // Some HTTP failures look like clean EOF to the demuxer.
         constexpr int64_t end_tolerance_ms = 2000;
         const bool ended_early = position >= 0 && position + end_tolerance_ms < duration_ms_;
-        if ((no_picture || ended_early || (failed_ && read_error_)) && network_retries_ < 2) {
-            std::lock_guard<std::mutex> lock(requests_);
-            if (authorized_clip_ && !start_requested_ && !stop_requested_) {
-                if (promoted_hls_ && no_picture) hardware_failed_ = true;
-                if (!fallback_source_.empty() && no_picture) {
-                    requested_source_ = std::move(fallback_source_);
-                    fallback_source_.clear();
-                    fprintf(stderr, "[direct] mapped MP4 had no video, trying original HLS\n");
-                }
-                if (!no_picture && position > 0) requested_position_ = position / 1000.0;
-                reopen_input_ = start_requested_ = true;
-                ++network_retries_;
-                fprintf(stderr, "[direct] reconnecting at %.2f s (attempt %u)\n",
-                        requested_position_, network_retries_);
-                return true;
-            }
+        if ((no_picture || ended_early || (failed_ && read_error_)) && retry_input(no_picture, position))
+            return true;
+        if (no_picture && failed_ && read_error_ && active_forward_keyframe_ && media.starfish_video() &&
+            input_error_ != tls_verify_failed && input_error_ != AVERROR_INVALIDDATA) {
+            recover_hardware(media, true, "input retries exhausted during forward recovery");
+            return true;
         }
         fprintf(stderr, "[direct] done packets=%u frames=%u audio=%u\n",
                 feeds_.load(), media.frames.load(), audio_feeds_.load());
         const bool playback_failed = failed_ || (media.failed && !starfish_tail_completed_);
+        const int input_error = input_error_;
         join();
         quality_index_ = -1;
         loading_ = false;
         media.close();
         decoder.reset();
         playing_ = false;
-        const char *message = no_picture ? "Safari source returned no video" :
+        const char *message = input_error == tls_verify_failed ? "Video server certificate verification failed" :
+            input_error == AVERROR(ETIMEDOUT) ? "Video connection timed out" :
+            input_error == AVERROR_INVALIDDATA && no_picture ? "Video format is not supported" :
+            input_error < 0 && no_picture ? "Could not read the video source" :
+            no_picture ? "Safari source returned no video" :
             (playback_failed || ended_early) ? "Safari video interrupted" : "Safari video finished";
         show_status(message);
         shell.screen(message, "");
