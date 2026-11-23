@@ -7,6 +7,7 @@ UxPlay webOS is GPL-3.0-or-later. The exact source revisions and archive checksu
 | FDH2/UxPlay 1.74 | AirPlay/RAOP, pairing, mDNS; unchanged upstream core | GPL-3.0-or-later; library files also carry LGPL notices |
 | llhttp (within UxPlay) | HTTP parser | MIT |
 | OpenSSL 3.5.8 | Statically linked cryptography | Apache-2.0 |
+| jitterentropy 3.6.3 | Statically linked entropy source for OpenSSL | BSD-3-Clause |
 | libplist 2.7.0 | Statically linked property lists | LGPL-2.1-or-later |
 | FFmpeg 8.1.2 | Statically linked AAC/ALAC/PCM decoding and resampling | LGPL-2.1-or-later (no GPL/nonfree options enabled) |
 | GCC 12.2 libstdc++ | Private shared C++ runtime from the webOS Brew native toolchain | GPL-3.0 with GCC Runtime Library Exception 3.1 |

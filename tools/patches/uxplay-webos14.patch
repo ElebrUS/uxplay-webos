@@ -76,6 +76,39 @@ index 762c648..6be6c76 100644
  }
  #include <stdio.h>
  void pk_to_base64(const unsigned char *pk, int pk_len, char *pk_base64, int len) {
+diff --git a/lib/http_handlers.h b/lib/http_handlers.h
+index 8e06266..3a690c8 100644
+--- a/lib/http_handlers.h
++++ b/lib/http_handlers.h
+@@ -381,6 +381,7 @@ http_handler_reverse(raop_conn_t *conn, http_request_t *request, http_response_t
+     int type_PTTH = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_PTTH);
+ 
+     if (type_PTTH == 1) {
++        conn->connection_type = CONNECTION_TYPE_PTTH;
+         logger_log(raop->logger, LOGGER_DEBUG, "will use socket %d for %s connections", socket_fd, purpose);
+         http_response_init(response, "HTTP/1.1", 101, "Switching Protocols");
+         http_response_add_header(response, "Connection", "Upgrade");
+diff --git a/lib/raop.c b/lib/raop.c
+index b6fc8f3..7dfa86c 100644
+--- a/lib/raop.c
++++ b/lib/raop.c
+@@ -551,6 +551,16 @@ conn_destroy(void *ptr) {
+     raop_t *raop = conn->raop;
+     logger_log(raop->logger, LOGGER_DEBUG, "Destroying connection");
+ 
++    /* Ordinary AirPlay HTTP requests can use a new socket for each request. */
++    if (conn->connection_type == CONNECTION_TYPE_PTTH && conn->client_session_id &&
++        raop->callbacks.on_video_stop) {
++        airplay_video_t *video = hls_get_current_video(raop);
++        const char *session_id = video ? get_apple_session_id(video) : NULL;
++        if (session_id && !strcmp(session_id, conn->client_session_id)) {
++            raop->callbacks.on_video_stop(raop->callbacks.cls);
++        }
++    }
++
+     if (raop->callbacks.conn_destroy) {
+         raop->callbacks.conn_destroy(raop->callbacks.cls);
+     }
 diff --git a/lib/raop_rtp_mirror.c b/lib/raop_rtp_mirror.c
 index 4ddedfd..29eae14 100644
 --- a/lib/raop_rtp_mirror.c

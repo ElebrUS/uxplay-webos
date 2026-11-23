@@ -65,6 +65,8 @@ bool Shell::open() {
     if (window && !renderer) renderer = SDL_CreateRenderer(window,-1,SDL_RENDERER_SOFTWARE);
 #endif
     if (!renderer) { fprintf(stderr,"[SDL] %s\n",SDL_GetError()); return false; }
+    SDL_ShowCursor(SDL_DISABLE);
+    cursor_until_ = 0;
     int width = 0, height = 0;
     SDL_GetRendererOutputSize(renderer, &width, &height);
     fprintf(stderr, "[SDL] window %dx%d, renderer %dx%d\n", mode.w, mode.h, width, height);
@@ -78,10 +80,25 @@ void Shell::transparent() {
     SDL_SetRenderDrawColor(renderer,0,0,0,0); SDL_RenderClear(renderer); SDL_RenderPresent(renderer);
 }
 Action Shell::action() {
+    constexpr int64_t cursor_idle_ns = 3LL * 1000000000;
+    if (cursor_until_ && now_ns() >= cursor_until_) {
+        SDL_ShowCursor(SDL_DISABLE);
+        cursor_until_ = 0;
+    }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) return Action::Exit;
-        if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) return Action::Select;
+        if (e.type == SDL_MOUSEMOTION && (e.motion.xrel || e.motion.yrel) &&
+            e.motion.which != SDL_TOUCH_MOUSEID) {
+            if (!cursor_until_) SDL_ShowCursor(SDL_ENABLE);
+            cursor_until_ = now_ns() + cursor_idle_ns;
+            pointer_ = {e.motion.x, e.motion.y};
+            return Action::PointerMove;
+        }
+        if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
+            pointer_ = {e.button.x, e.button.y};
+            return Action::PointerClick;
+        }
         if (e.type == SDL_KEYUP &&
             (e.key.keysym.scancode == SDL_SCANCODE_LEFT || e.key.keysym.scancode == SDL_SCANCODE_RIGHT))
             return Action::SeekRelease;
@@ -103,6 +120,15 @@ Action Shell::action() {
     return interrupted?Action::Exit:Action::None;
 }
 bool Shell::pump() {Action a=action();return a!=Action::Back&&a!=Action::Exit;}
+
+SDL_Point Shell::pointer() const {
+    int width = 0, height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    const double scale = std::min(width / 1920.0, height / 1080.0);
+    if (scale <= 0) return {-1, -1};
+    return {int(std::floor((pointer_.x - (width - 1920 * scale) / 2) / scale)),
+            int(std::floor((pointer_.y - (height - 1080 * scale) / 2) / scale))};
+}
 
 namespace {
 constexpr SDL_Color primary = {247, 249, 255, 255};
@@ -340,7 +366,7 @@ void Shell::playback_loader() {
 }
 
 void Shell::playback_controls(int position, int duration, bool paused, int target, bool confirm_seek,
-                              const std::string &quality) {
+                              const std::string &quality, int hover) {
     const Canvas c(renderer);
     if (c.scale <= 0) return;
     position = std::max(0, std::min(position, duration));
@@ -376,6 +402,14 @@ void Shell::playback_controls(int position, int duration, bool paused, int targe
         ? int(int64_t(986) * std::min(target, duration) / duration) : progress;
     rounded(renderer, c.box(467, 928, progress, 6), c.units(3), accent);
     rounded(renderer, c.box(459 + cursor, 923, 16, 16), c.units(8), target >= 0 ? primary : accent);
+
+    if (hover >= 0 && target < 0 && duration > 0) {
+        const int marker = 467 + int(int64_t(986) * std::min(hover, duration) / duration);
+        char time[24];
+        snprintf(time, sizeof(time), "%02d:%02d", hover / 60, hover % 60);
+        panel(renderer, c, marker - 50, 878, 100, 36, 12, {27, 39, 59, 250});
+        text(time, c.x(marker), c.y(896), c.units(19), c.units(90), primary, Align::Center);
+    }
 
     char elapsed[24], total[24];
     snprintf(elapsed, sizeof(elapsed), "%02d:%02d", position / 60, position % 60);

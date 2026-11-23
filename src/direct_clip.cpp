@@ -14,6 +14,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <iterator>
 #include <limits>
 #include <fstream>
 #include <memory>
@@ -106,6 +107,7 @@ bool DirectClip::play(const char *url, double start) {
         request.substr(0, request.find('#')) : "";
     new_clip_ = true;
     reopen_input_ = false;
+    forward_keyframe_ = false;
     requested_position_ = std::isfinite(start) && start >= 0 && start <= 36000 ? start : 0;
     start_requested_ = true;
     stop_requested_ = requested_pause_ = false;
@@ -122,6 +124,7 @@ void DirectClip::seek(double position) {
         (current_ms < 5000 && std::fabs(requested_position_ - position) < 0.05)) return;
     fprintf(stderr, "[direct] seek %.2f seconds\n", position);
     requested_position_ = position;
+    forward_keyframe_ = false;
     start_requested_ = true;
     stop_requested_ = false;
 }
@@ -129,7 +132,38 @@ void DirectClip::pause(bool value) {
     std::lock_guard<std::mutex> lock(requests_);
     requested_pause_ = value;
 }
-bool DirectClip::remote(Action action, Media &media) {
+bool DirectClip::remote(Action action, Media &media, SDL_Point pointer) {
+    if (action == Action::PointerMove || action == Action::PointerClick) {
+        const auto now = now_ns();
+        const bool visible = controls_until_ > now || paused_ || scrub_seconds_ >= 0;
+        controls_until_ = now + 4 * ns_per_second;
+        const int previous_hover = pointer_seconds_;
+        const double duration = duration_ms_.load() / 1000.0;
+        const bool on_timeline = pointer.y >= 912 && pointer.y <= 950 &&
+            pointer.x >= 467 && pointer.x <= 1453 && duration > 0;
+        const double target = on_timeline ? std::min(duration - 0.001, (pointer.x - 467) * duration / 986) : -1;
+        pointer_seconds_ = playing_ && !loading_ && quality_index_ < 0 && on_timeline ? int(target) : -1;
+        pointer_until_ = now + 3 * ns_per_second;
+        if (action == Action::PointerClick && visible && playing_ && !loading_ && quality_index_ < 0) {
+            if (on_timeline) {
+                scrub_seconds_ = -1;
+                scrub_commit_at_ = 0;
+                seek(target);
+            } else if (pointer.y >= 825 && pointer.y <= 903) {
+                if (pointer.x >= 921 && pointer.x <= 999) action = Action::Select;
+                if (duration > 0 && (std::abs(pointer.x - 810) <= 39 || std::abs(pointer.x - 1110) <= 39)) {
+                    scrub_seconds_ = -1;
+                    scrub_commit_at_ = 0;
+                    const double position = std::max(0, position_ms_.load()) / 1000.0;
+                    seek(std::max(0.0, std::min(duration - 0.001, position + (pointer.x < 960 ? -10 : 10))));
+                }
+            }
+        }
+        if (action != Action::Select) {
+            if (action == Action::PointerClick || !visible || pointer_seconds_ != previous_hover) media.redraw();
+            return true;
+        }
+    }
     if (quality_remote(action)) {
         media.redraw();
         return true;
@@ -234,7 +268,7 @@ void DirectClip::draw_controls(Shell &shell, const Media &media) const {
         scrub_seconds_ < 0 && now_ns() >= controls_until_) return;
     const int width = media.video_width(), height = media.video_height();
     const std::string resolution = width > 0 ? std::to_string(width) + " x " + std::to_string(height) +
-        (media.hardware_video() ? "  HW" : "") : "";
+        (media.starfish_video() ? "  Starfish" : media.hardware_video() ? "  HW" : "") : "";
     if (quality_index_ >= 0) {
         const int selection = quality_choices_[quality_index_];
         shell.playback_quality(selection > 0 ? std::to_string(selection) + "p" : "Auto",
@@ -250,7 +284,8 @@ void DirectClip::draw_controls(Shell &shell, const Media &media) const {
     } else if (playing_ && !loading_ && (paused_ || now_ns() < controls_until_)) {
         const std::string label = multiple_renditions_ && duration_ms_ > 0 ?
             resolution + "  |  UP: Quality" : resolution;
-        shell.playback_controls(position_ms_ / 1000, duration_ms_ / 1000, paused_, -1, false, label);
+        shell.playback_controls(position_ms_ / 1000, duration_ms_ / 1000, paused_, -1, false, label,
+                                now_ns() < pointer_until_ ? pointer_seconds_ : -1);
     }
 }
 
@@ -344,11 +379,19 @@ bool DirectClip::enqueue(Sample sample) {
     });
     if (interrupted_) return false;
     queued_bytes_ += sample.data.size();
-    queue_.push_back(std::move(sample));
+    // MOV can return nearby audio and video chunks in file order. Schedule them
+    // by decode time without changing packet order within either track.
+    auto position = queue_.end();
+    while (position != queue_.begin()) {
+        const auto previous = std::prev(position);
+        if (previous->video == sample.video || previous->decode_at <= sample.decode_at) break;
+        position = previous;
+    }
+    queue_.insert(position, std::move(sample));
     return true;
 }
 
-void DirectClip::read(double start, std::string source) {
+void DirectClip::read(double start, std::string source, bool forward_keyframe) {
     const bool needs_seek = input_ || start > 0;
     auto demux = [&] {
         if (!input_) {
@@ -417,6 +460,17 @@ void DirectClip::read(double start, std::string source) {
                   (audio_params->extradata && audio_params->extradata_size >= 2 &&
                    audio_params->extradata_size <= 1024));
         audio_config_.clear();
+        starfish_stream_.fps_num = frame_rate.num > 0 ? frame_rate.num : 30;
+        starfish_stream_.fps_den = frame_rate.den > 0 ? frame_rate.den : 1;
+        starfish_stream_.audio_rate = audio_ ? audio_params->sample_rate : 0;
+        starfish_stream_.audio_channels = audio_ ? audio_params->ch_layout.nb_channels : 0;
+        starfish_audio_supported_ = !audio_ || (audio_params->profile == AV_PROFILE_AAC_LOW &&
+            starfish_stream_.audio_rate > 0 && starfish_stream_.audio_channels > 0 &&
+            starfish_stream_.audio_channels <= 2);
+        if (audio_ && !starfish_audio_supported_) {
+            fprintf(stderr, "[direct] Starfish AAC unsupported: profile=%d rate=%d channels=%d\n",
+                    audio_params->profile, starfish_stream_.audio_rate, starfish_stream_.audio_channels);
+        }
         if (audio_ && audio_params->extradata_size > 0) {
             audio_config_.assign(audio_params->extradata,
                                  audio_params->extradata + audio_params->extradata_size);
@@ -433,11 +487,17 @@ void DirectClip::read(double start, std::string source) {
         if (av_bsf_init(filter) < 0) return false;
 
         const int64_t input_start = input->start_time == AV_NOPTS_VALUE ? 0 : input->start_time;
+        hls_input_ = std::strcmp(input->iformat->name, "hls") == 0;
         if (needs_seek && input->duration > 0) {
-            deadline_ = now_ns() + timeout_ns;
+            const auto seek_started = now_ns();
+            deadline_ = seek_started + timeout_ns;
             const int64_t target = av_rescale_q(input_start + int64_t(start * AV_TIME_BASE), AV_TIME_BASE_Q,
                                                 input->streams[video]->time_base);
-            if (av_seek_frame(input, video, target, AVSEEK_FLAG_BACKWARD) < 0) return false;
+            if ((!forward_keyframe || av_seek_frame(input, video, target, 0) < 0) &&
+                av_seek_frame(input, video, target, AVSEEK_FLAG_BACKWARD) < 0)
+                return false;
+            if (hls_input_)
+                fprintf(stderr, "[direct] HLS demux seek ready after %.3f s\n", (now_ns() - seek_started) / 1e9);
         }
         std::unique_ptr<AVPacket, decltype(&free_packet)> packet(av_packet_alloc(), free_packet);
         if (!packet) return false;
@@ -495,9 +555,57 @@ void DirectClip::read(double start, std::string source) {
     finished_ = true;
 }
 
+void DirectClip::recover_hardware(const Media &media, bool starfish, const char *reason) {
+    std::lock_guard<std::mutex> lock(requests_);
+    if (!authorized_clip_ || start_requested_ || stop_requested_) return;
+    const int64_t displayed = media.display_position();
+    if (displayed >= 0) requested_position_ = double(displayed) / ns_per_second;
+    else if (position_ms_ >= 0) requested_position_ = position_ms_ / 1000.0;
+    if (starfish) {
+        if (++starfish_retries_ < 3) {
+            fprintf(stderr, "[direct] Starfish failed, attempting retry %u/2 before LGNC fallback\n", starfish_retries_);
+            if (starfish_retries_ == 1 && media.starfish_end_error() && displayed >= 0)
+                starfish_fault_position_ = requested_position_;
+            if (starfish_retries_ == 2 && media.starfish_end_error() && starfish_fault_position_ >= 0 &&
+                starfish_fault_position_ + 2 < duration_ms_ / 1000.0) {
+                requested_position_ = starfish_fault_position_ + 0.5;
+                forward_keyframe_ = true;
+            }
+        } else {
+            starfish_failed_ = true;
+            if (starfish_fault_position_ >= 0 &&
+                (displayed < 0 || requested_position_ <= starfish_fault_position_ + 2))
+                requested_position_ = starfish_fault_position_;
+            fprintf(stderr, "[direct] Starfish exhausted retries, falling back to LGNC\n");
+        }
+    } else {
+        hardware_failed_ = true;
+    }
+    reopen_input_ = start_requested_ = true;
+    fprintf(stderr, "[direct] recovering from %s at %.2f s (%s%s)\n",
+            starfish ? "Starfish" : "LGNC", requested_position_, reason,
+            forward_keyframe_ ? ", next keyframe" : "");
+}
+
+FeedResult DirectClip::feed_sample(Media &media, const Sample &sample) {
+    const auto result = media.feed(sample.data.data(), sample.data.size(), sample.pts, sample.video);
+    if (result != FeedResult::Retry) {
+        hardware_retry_since_ = 0;
+        return result;
+    }
+    const int64_t now = now_ns();
+    if (hardware_retry_since_ == 0) hardware_retry_since_ = now;
+    const int64_t limit = media.starfish_video() ? 2500 : 750;
+    return now - hardware_retry_since_ < limit * ns_per_ms ? FeedResult::Retry : FeedResult::Error;
+}
+
 bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const char *app_id,
                       const std::function<void()> &before_start,
                       const std::function<void(const char *)> &show_status) {
+    if (pointer_seconds_ >= 0 && now_ns() >= pointer_until_) {
+        pointer_seconds_ = -1;
+        media.redraw();
+    }
     if (scrub_seconds_ >= 0 && scrub_commit_at_ && now_ns() >= scrub_commit_at_) {
         const int target = scrub_seconds_;
         scrub_seconds_ = -1;
@@ -505,7 +613,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         fprintf(stderr, "[remote] quick seek to %d seconds\n", target);
         seek(target);
     }
-    bool start, stop_requested, pause, new_clip, reopen;
+    bool start, stop_requested, pause, new_clip, reopen, forward_keyframe;
     double seek;
     std::string source;
     {
@@ -515,9 +623,11 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         pause = requested_pause_ || (scrub_seconds_ >= 0 && !loading_);
         new_clip = new_clip_;
         reopen = reopen_input_;
+        forward_keyframe = forward_keyframe_;
         if (start) source = requested_source_;
         seek = requested_position_;
         start_requested_ = stop_requested_ = new_clip_ = reopen_input_ = false;
+        forward_keyframe_ = false;
     }
     if (start || (stop_requested && (playing_ || worker_.joinable()))) {
         if (playing_) {
@@ -540,8 +650,12 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         const bool reuse_input = !stop_requested && !new_clip && !reopen;
         join(reuse_input);
         quality_index_ = -1;
+        pointer_seconds_ = -1;
         if (stop_requested || new_clip) {
             hardware_failed_ = false;
+            starfish_failed_ = false;
+            starfish_retries_ = 0;
+            starfish_fault_position_ = -1;
             next_quality_height_ = 0;
             std::lock_guard<std::mutex> lock(requests_);
             rendition_heights_.clear();
@@ -551,7 +665,8 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             scrub_commit_at_ = 0;
         }
         quality_height_ = next_quality_height_;
-        prefer_hardware_hls_ = media.hardware_enabled() && !hardware_failed_;
+        prefer_hardware_hls_ = !hardware_failed_ &&
+            (media.hardware_enabled() || (media.starfish_enabled() && !starfish_failed_));
         if (!reuse_input) promoted_hls_ = false;
         media.close();
         decoder.reset();
@@ -561,6 +676,10 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         hardware_retry_since_ = 0;
         next_hardware_draw_ = 0;
         hardware_drain_until_ = 0;
+        starfish_draining_ = false;
+        starfish_eos_sent_ = false;
+        starfish_tail_completed_ = false;
+        last_video_pts_ = -1;
         hardware_overlay_visible_ = false;
         last_hardware_feed_ = max_hardware_gap_ = max_hardware_lateness_ = 0;
         if (stop_requested) return false;
@@ -570,7 +689,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         interrupted_ = false;
         finished_ = failed_ = read_error_ = false;
         feeds_ = audio_feeds_ = 0;
-        worker_ = std::thread(&DirectClip::read, this, seek, std::move(source));
+        worker_ = std::thread(&DirectClip::read, this, seek, std::move(source), forward_keyframe);
     }
 
     if (!worker_.joinable()) return false;
@@ -580,8 +699,11 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
     }
     if (!playing_ && ready_) {
         const bool audio_ready = audio_ && decoder.configure_aac(audio_config_.data(), audio_config_.size());
-        const bool attempt_hardware = media.hardware_enabled() && hardware_eligible_ && !hardware_failed_;
-        if (media.open_clip(width_, height_, audio_ready, attempt_hardware ? app_id : nullptr)) {
+        const bool attempt_starfish = media.starfish_enabled() && !starfish_failed_ && starfish_audio_supported_;
+        const bool attempt_hardware = (media.hardware_enabled() || attempt_starfish) &&
+            hardware_eligible_ && !hardware_failed_;
+        if (media.open_clip(width_, height_, audio_ready, attempt_hardware ? app_id : nullptr,
+                            attempt_starfish ? &starfish_stream_ : nullptr)) {
             if (attempt_hardware && !media.hardware_video()) {
                 hardware_failed_ = true;
                 fprintf(stderr, "[direct] LGNC unavailable, using software\n");
@@ -599,8 +721,36 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             playing_ = true;
             origin_ = 0;
             fprintf(stderr, "[direct] video open %dx%d audio=%d\n", width_.load(), height_.load(), int(audio_));
+        } else if (attempt_hardware && attempt_starfish) {
+            recover_hardware(media, true, "pipeline open failed");
+            return true;
         } else {
             stop();
+        }
+    }
+    if (media.starfish_video()) {
+        media.tick();
+        if (media.failed) {
+            const int64_t displayed = media.display_position();
+            bool input_drained = false;
+            if (finished_ && !failed_) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                input_drained = queue_.empty();
+            }
+            // Rockhopper can report an error after EOS even when the final
+            // presentation interval has already completed.
+            const bool drained = input_drained && media.starfish_end_error() &&
+                displayed >= 0 && last_video_pts_ >= 0 &&
+                displayed + 900 * ns_per_ms >= last_video_pts_ &&
+                last_video_pts_ / ns_per_ms + 500 >= duration_ms_;
+            if (!drained) {
+                recover_hardware(media, true, "pipeline reported an error");
+                return true;
+            }
+            if (!starfish_tail_completed_) {
+                starfish_tail_completed_ = true;
+                fprintf(stderr, "[direct] Starfish ended after all packets were submitted\n");
+            }
         }
     }
     if (media.hardware_video() && !loading_) {
@@ -617,7 +767,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         if (playing_ && paused_ != pause) {
             empty_since_ = 0;
             last_hardware_feed_ = 0;
-            media.pause(pause || rebuffering_);
+            if (!media.starfish_video() || preview_at_ < 0) media.pause(pause || rebuffering_);
             if (pause) paused_at_ = now;
             else if (origin_ != 0) origin_ += now - paused_at_;
             paused_ = pause;
@@ -671,7 +821,11 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             empty = queue_.empty();
             if (empty || !playing_ || rebuffering_ || (paused_ && preview_at_ < 0)) break;
             const auto now = now_ns();
-            if (preview_at_ < 0) {
+            // HLS seeks to the segment's keyframe. Feed preroll without
+            // waiting in real time, then pace normally at the target.
+            const bool hls_preroll = preview_at_ >= 0 && hls_input_ &&
+                queue_.front().decode_at < preview_at_;
+            if (preview_at_ < 0 || (media.starfish_video() && !hls_preroll)) {
                 if (origin_ == 0) origin_ = now - queue_.front().decode_at;
                 if (queue_.front().decode_at > now - origin_) break;
             }
@@ -679,35 +833,30 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             sample = std::move(queue_.front());
             queue_.pop_front();
         }
-        if (sample.video) {
-            const int64_t submit_at = now_ns();
-            if (preview_at_ < 0) media.set_playback_clock(submit_at - origin_);
-            const auto result = media.feed(sample.data.data(), sample.data.size(), sample.pts, true);
+        const bool starfish_audio = media.starfish_video() && !sample.video &&
+            (preview_at_ < 0 || sample.pts >= preview_at_);
+        const int64_t submit_at = now_ns();
+        if (sample.video && preview_at_ < 0) media.set_playback_clock(submit_at - origin_);
+        if (sample.video || starfish_audio) {
+            const auto result = feed_sample(media, sample);
             if (result == FeedResult::Retry) {
-                const int64_t now = now_ns();
-                if (hardware_retry_since_ == 0) hardware_retry_since_ = now;
-                if (now - hardware_retry_since_ < 750 * ns_per_ms) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    queued_bytes_ += sample.data.size();
-                    queue_.push_front(std::move(sample));
-                    break;
-                }
-            }
-            hardware_retry_since_ = 0;
-            if (result != FeedResult::Accepted && media.hardware_video()) {
-                std::lock_guard<std::mutex> lock(requests_);
-                if (authorized_clip_ && !start_requested_ && !stop_requested_) {
-                    hardware_failed_ = true;
-                    if (position_ms_ >= 0) requested_position_ = position_ms_ / 1000.0;
-                    reopen_input_ = start_requested_ = true;
-                    fprintf(stderr, "[direct] recovering with software at %.2f s\n", requested_position_);
-                }
-                return true;
+                std::lock_guard<std::mutex> lock(mutex_);
+                queued_bytes_ += sample.data.size();
+                queue_.push_front(std::move(sample));
+                break;
             }
             if (result == FeedResult::Error) {
+                if (media.hardware_video()) {
+                    recover_hardware(media, media.starfish_video(), "packet submission failed");
+                    return true;
+                }
                 stop();
                 break;
             }
+            if (starfish_audio) ++audio_feeds_;
+        }
+        if (sample.video) {
+            last_video_pts_ = std::max(last_video_pts_, sample.pts);
             if (media.hardware_video() && preview_at_ < 0) {
                 if (last_hardware_feed_ != 0)
                     max_hardware_gap_ = std::max(max_hardware_gap_, submit_at - last_hardware_feed_);
@@ -719,13 +868,14 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
                 fprintf(stderr, "[direct] packets=%u frames=%u audio=%u\n",
                         count, media.frames.load(), audio_feeds_.load());
                 if (media.hardware_video() && count > 1) {
-                    fprintf(stderr, "[lgnc] max feed gap=%lld ms late=%lld ms\n",
+                    fprintf(stderr, "[direct] hardware max feed gap=%lld ms late=%lld ms\n",
                             static_cast<long long>(max_hardware_gap_ / ns_per_ms),
                             static_cast<long long>(max_hardware_lateness_ / ns_per_ms));
                     max_hardware_gap_ = max_hardware_lateness_ = 0;
                 }
             }
-        } else if (preview_at_ < 0 && sample.pts >= now_ns() - origin_ - 160 * ns_per_ms) {
+        } else if (!media.starfish_video() && preview_at_ < 0 &&
+                   sample.pts >= now_ns() - origin_ - 160 * ns_per_ms) {
             std::vector<uint8_t> pcm;
             if (decoder.decode(4, sample.data.data(), sample.data.size(), pcm) && !pcm.empty()) {
                 if (media.feed(pcm.data(), pcm.size(), sample.pts, false) == FeedResult::Accepted) ++audio_feeds_;
@@ -736,8 +886,11 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         if (sample.video && preview_at_ >= 0 && media.frames > 0) {
             preview_at_ = -1;
             // Anchor playback to the prefetched frame after a seek.
-            origin_ = now_ns() - sample.decode_at;
-            if (paused_) paused_at_ = now_ns();
+            if (!media.starfish_video()) origin_ = now_ns() - sample.decode_at;
+            if (paused_) {
+                paused_at_ = now_ns();
+                media.pause(true);
+            }
         }
         if (loading_ && preview_at_ < 0 && media.frames > 0) {
             loading_ = false;
@@ -747,14 +900,28 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         }
     }
     if (finished_ && empty) {
-        if (media.hardware_video() && media.frames > 0) {
+        if (media.starfish_video()) {
+            const int64_t now = now_ns();
+            if (!starfish_draining_) {
+                starfish_draining_ = true;
+                hardware_drain_until_ = now + 1200 * ns_per_ms;
+            }
+            if (!starfish_eos_sent_ && !starfish_tail_completed_) {
+                const int64_t displayed = media.display_position();
+                if (displayed < last_video_pts_ - 200 * ns_per_ms && now < hardware_drain_until_) return true;
+                media.eos();
+                starfish_eos_sent_ = true;
+                hardware_drain_until_ = now + 1000 * ns_per_ms;
+            }
+            if (!media.ended && !media.failed && now < hardware_drain_until_) return true;
+        } else if (media.hardware_video() && media.frames > 0) {
             const int64_t now = now_ns();
             if (hardware_drain_until_ == 0) hardware_drain_until_ = now + 180 * ns_per_ms;
             if (now < hardware_drain_until_) return true;
         }
         const int position = position_ms_;
         media.end_loading();
-        media.eos();
+        if (!starfish_draining_) media.eos();
         const bool no_picture = media.frames == 0;
         // Some HTTP failures look like clean EOF to the demuxer.
         constexpr int64_t end_tolerance_ms = 2000;
@@ -778,7 +945,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
         }
         fprintf(stderr, "[direct] done packets=%u frames=%u audio=%u\n",
                 feeds_.load(), media.frames.load(), audio_feeds_.load());
-        const bool playback_failed = failed_ || media.failed;
+        const bool playback_failed = failed_ || (media.failed && !starfish_tail_completed_);
         join();
         quality_index_ = -1;
         loading_ = false;

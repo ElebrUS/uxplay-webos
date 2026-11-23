@@ -9,13 +9,26 @@
 class StarfishMediaAPIs;
 struct SDL_Renderer;
 enum class FeedResult { Accepted, Retry, Error };
+#ifdef WEBOS14
+struct StarfishStream {
+    int fps_num = 30;
+    int fps_den = 1;
+    int audio_rate = 0;
+    int audio_channels = 0;
+};
+#endif
 class Media {
 public:
 #ifdef WEBOS14
     explicit Media(SDL_Renderer *renderer);
-    bool open_clip(int width, int height, bool audio, const char *hardware_app_id = nullptr);
+    bool open_clip(int width, int height, bool audio, const char *hardware_app_id = nullptr,
+                   const StarfishStream *starfish_stream = nullptr);
     bool hardware_enabled() const;
     bool hardware_video() const;
+    bool starfish_video() const;
+    bool starfish_end_error() const;
+    bool starfish_enabled() const;
+    int64_t display_position() const;
     void show_frames_from(int64_t pts_ns);
     void set_playback_clock(int64_t pts_ns);
     int video_width() const;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "raop.h"
+#include "media.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -13,8 +14,8 @@
 
 struct AVFormatContext;
 struct AVIOContext;
+struct SDL_Point;
 class AudioDecoder;
-class Media;
 class Shell;
 enum class Action;
 
@@ -29,7 +30,7 @@ public:
     bool tick(Media &media, AudioDecoder &decoder, Shell &shell, const char *app_id,
               const std::function<void()> &before_start,
               const std::function<void(const char *)> &show_status);
-    bool remote(Action action, Media &media);
+    bool remote(Action action, Media &media, SDL_Point pointer);
     void draw_controls(Shell &shell, const Media &media) const;
     void info(playback_info_t &out) const;
 
@@ -40,11 +41,13 @@ private:
         int64_t pts;
         bool video;
     };
-    void read(double start, std::string source);
+    void read(double start, std::string source, bool forward_keyframe);
     void join(bool keep_input = false);
     void close_input();
     bool load_playlist(const std::string &url, std::string &resolved);
     bool quality_remote(Action action);
+    void recover_hardware(const Media &media, bool starfish, const char *reason);
+    FeedResult feed_sample(Media &media, const Sample &sample);
     bool enqueue(Sample sample);
     std::string profile_url_;
     std::string profile_media_;
@@ -82,11 +85,19 @@ private:
     bool playing_ = false;
     bool paused_ = false;
     bool hardware_failed_ = false;
+    bool starfish_failed_ = false;
+    unsigned starfish_retries_ = 0;
+    double starfish_fault_position_ = -1;
+    bool forward_keyframe_ = false;
     bool prefer_hardware_hls_ = false;
     std::atomic<bool> promoted_hls_{false};
     int64_t hardware_retry_since_ = 0;
     int64_t next_hardware_draw_ = 0;
     int64_t hardware_drain_until_ = 0;
+    bool starfish_draining_ = false;
+    bool starfish_eos_sent_ = false;
+    bool starfish_tail_completed_ = false;
+    int64_t last_video_pts_ = -1;
     bool hardware_overlay_visible_ = false;
     int64_t last_hardware_feed_ = 0;
     int64_t max_hardware_gap_ = 0;
@@ -99,6 +110,8 @@ private:
     int64_t next_loader_draw_ = 0;
     int64_t controls_until_ = 0;
     int scrub_seconds_ = -1;
+    int pointer_seconds_ = -1;
+    int64_t pointer_until_ = 0;
     int64_t scrub_commit_at_ = 0;
     int64_t hold_started_ = 0;
     int64_t last_scrub_step_ = 0;
@@ -115,6 +128,9 @@ private:
     std::atomic<int> position_ms_{-1};
     std::atomic<bool> audio_{false};
     std::atomic<bool> hardware_eligible_{false};
+    bool hls_input_ = false;
+    StarfishStream starfish_stream_;
+    bool starfish_audio_supported_ = false;
     std::atomic<unsigned> feeds_{0};
     std::atomic<unsigned> audio_feeds_{0};
 };

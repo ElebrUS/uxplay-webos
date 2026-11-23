@@ -13,9 +13,17 @@ export LDFLAGS="--sysroot=$sdk/arm-webos-linux-gnueabi/sysroot"
 mkdir -p "$prefix" build/logs
 build_stamp="$(shasum -a 256 "$0" | cut -d ' ' -f 1)"
 previous_stamp="$(cat "$prefix/build-config.sha256" 2>/dev/null || true)"
-if [ ! -f "$prefix/lib/libcrypto.a" ]; then
+if [ ! -f "$prefix/lib/libcrypto.a" ] || [ ! -f "$prefix/lib/libjitterentropy.a" ] ||
+   ! grep -q libjitterentropy "$prefix/lib/pkgconfig/libcrypto.pc"; then
+    jitter="$root/.cache/jitterentropy-library-3.6.3"
+    make -C "$jitter" CC="$CC" AR="$AR" jitterentropy-static >build/logs/jitterentropy.log 2>&1
+    cp "$jitter/libjitterentropy.a" "$prefix/lib/"
+
     (cd .cache/openssl-3.5.8
-     ./Configure linux-armv4 no-shared no-tests no-module no-async --prefix="$prefix" --libdir=lib
+     if [ -f Makefile ]; then make clean; fi
+     ./Configure linux-armv4 no-shared no-tests no-module no-async enable-jitter \
+         --with-jitter-include="$jitter" --with-jitter-lib="$prefix/lib" \
+         -DOPENSSL_DEFAULT_SEED_SRC=JITTER --prefix="$prefix" --libdir=lib
      make -j"${BUILD_JOBS:-2}" build_libs
      make install_dev) >build/logs/openssl.log 2>&1
 fi

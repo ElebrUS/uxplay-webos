@@ -18,14 +18,16 @@ int main() {
     if (!app_id) app_id = "com.github.danlflh.uxplaywebos";
 #ifdef DIRECT_EXPERIMENT
     // Optional application-local configuration for a native LGNC test package.
+    const bool starfish_lab = std::ifstream(app_directory() + "/experimental-starfish.txt").good();
     std::string experimental_id;
     std::ifstream experimental(app_directory() + "/experimental-lgnc.txt");
     if (std::getline(experimental, experimental_id) && !experimental_id.empty() &&
         experimental_id.size() < 128 &&
         experimental_id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.") == std::string::npos) {
         app_id = experimental_id.c_str();
-        setenv("UXPLAY_NAME", "UxPlay Hardware Lab", 1);
+        setenv("UXPLAY_NAME", starfish_lab ? "UxPlay Starfish Lab" : "UxPlay Hardware Lab", 1);
     }
+    if (starfish_lab) setenv("UXPLAY_STARFISH", "1", 1);
 #endif
     Shell shell;if(!shell.open())return 1;
     shell.screen("Starting AirPlay receiver","");
@@ -82,7 +84,8 @@ int main() {
         Action action=shell.action();
         if(action==Action::Exit)break;
 #ifdef DIRECT_EXPERIMENT
-        const bool handled = direct_active && direct.remote(action, media);
+        const bool handled = direct_active && direct.remote(action, media,
+            (action == Action::PointerClick || action == Action::PointerMove) ? shell.pointer() : SDL_Point{});
         const bool stop_direct = direct_active && action == Action::Back && !handled;
         if (stop_direct) direct.stop();
         direct_active = direct.tick(media, decoder, shell, app_id, start_direct,

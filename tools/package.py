@@ -23,6 +23,7 @@ def main():
         ('LICENSE', 'GPL-3.0.txt'),
         ('packaging/Inter-OFL.txt', 'Inter-OFL.txt'),
         ('.cache/openssl-3.5.8/LICENSE.txt', 'OpenSSL.txt'),
+        ('.cache/jitterentropy-library-3.6.3/LICENSE.bsd', 'jitterentropy-BSD.txt'),
         ('.cache/libplist-2.7.0/COPYING', 'libplist.txt'),
         ('.cache/ffmpeg-8.1.2/COPYING.LGPLv3', 'FFmpeg-LGPLv3.txt'),
         ('.cache/ffmpeg-8.1.2/COPYING.GPLv3', 'FFmpeg-GPLv3.txt'),

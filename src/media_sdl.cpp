@@ -2,6 +2,9 @@
 #ifdef WEBOS14_LGNC
 #include "media_lgnc.h"
 #endif
+#ifdef WEBOS14_STARFISH
+#include "media_starfish.h"
+#endif
 #include <SDL.h>
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -46,8 +49,20 @@ struct Media::Impl {
 #ifdef WEBOS14_LGNC
     LgncVideo hardware;
 #endif
+#ifdef WEBOS14_STARFISH
+    StarfishVideo starfish;
+#endif
+
+    bool starfish_video() const {
+#ifdef WEBOS14_STARFISH
+        return starfish.opened();
+#else
+        return false;
+#endif
+    }
 
     bool hardware_video() const {
+        if (starfish_video()) return true;
 #ifdef WEBOS14_LGNC
         return hardware.opened();
 #else
@@ -213,9 +228,25 @@ bool Media::open(const char *, int width, int height, bool audio, int rate) {
     return open_decoder(width, height, audio, rate, false);
 }
 
-bool Media::open_clip(int width, int height, bool audio, const char *hardware_app_id) {
+bool Media::open_clip(int width, int height, bool audio, const char *hardware_app_id,
+                      const StarfishStream *starfish_stream) {
+#ifdef WEBOS14_STARFISH
+    if (hardware_app_id && starfish_stream) {
+        close();
+        auto &state = *impl_;
+        if (state.starfish.open(hardware_app_id, width, height, *starfish_stream)) {
+            state.width = width;
+            state.height = height;
+            ready = playing = true;
+            return true;
+        }
+        return false;
+    }
+#else
+    (void)starfish_stream;
+#endif
 #ifdef WEBOS14_LGNC
-    if (hardware_app_id && width > 0 && height > 0) {
+    if (hardware_app_id && hardware_enabled() && width > 0 && height > 0) {
         close();
         auto &state = *impl_;
         if (state.hardware.open(hardware_app_id, width, height)) {
@@ -238,6 +269,28 @@ void Media::set_playback_clock(int64_t pts_ns) {
     impl_->clock_active = true;
 }
 bool Media::hardware_video() const { return impl_->hardware_video(); }
+bool Media::starfish_video() const { return impl_->starfish_video(); }
+bool Media::starfish_end_error() const {
+#ifdef WEBOS14_STARFISH
+    return starfish_video() && impl_->starfish.rockhopper_end_error();
+#else
+    return false;
+#endif
+}
+bool Media::starfish_enabled() const {
+#ifdef WEBOS14_STARFISH
+    const char *setting = std::getenv("UXPLAY_STARFISH");
+    return !setting || std::strcmp(setting, "0") != 0;
+#else
+    return false;
+#endif
+}
+int64_t Media::display_position() const {
+#ifdef WEBOS14_STARFISH
+    if (starfish_video()) return impl_->starfish.position();
+#endif
+    return -1;
+}
 bool Media::hardware_enabled() const {
 #ifdef WEBOS14_LGNC
     const char *setting = std::getenv("UXPLAY_LGNC");
@@ -279,6 +332,9 @@ bool Media::open_decoder(int width, int height, bool audio, int rate, bool buffe
 FeedResult Media::feed(const void *data, size_t size, int64_t pts_ns, bool video, bool present_video) {
     auto &state = *impl_;
     if (!ready || !data || size == 0 || size > INT_MAX) return FeedResult::Error;
+#ifdef WEBOS14_STARFISH
+    if (starfish_video()) return state.starfish.feed(data, size, pts_ns, video);
+#endif
     if (!video) {
         if (!state.audio) return FeedResult::Accepted;
         if (size > state.pcm.size() || size % 4) return FeedResult::Error;
@@ -297,7 +353,7 @@ FeedResult Media::feed(const void *data, size_t size, int64_t pts_ns, bool video
     }
 
 #ifdef WEBOS14_LGNC
-    if (hardware_video()) {
+    if (state.hardware.opened()) {
         const auto result = state.hardware.feed(data, size);
         if (result == FeedResult::Accepted && present_video && pts_ns >= state.first_visible_pts)
             ++frames;
@@ -341,17 +397,37 @@ FeedResult Media::receive_frames(bool present_video) {
         FeedResult::Accepted : FeedResult::Error;
 }
 
-void Media::tick() {}
+void Media::tick() {
+#ifdef WEBOS14_STARFISH
+    auto &state = *impl_;
+    if (starfish_video()) {
+        state.starfish.tick();
+        const auto position = state.starfish.position();
+        if (position >= 0 && position >= state.first_visible_pts) frames = state.starfish.frames();
+        failed = state.starfish.failed();
+        ended = state.starfish.ended();
+    }
+#endif
+}
 void Media::eos() {
     impl_->clock_active = false;
+#ifdef WEBOS14_STARFISH
+    if (starfish_video()) impl_->starfish.eos();
+#endif
     if (impl_->decoder && avcodec_send_packet(impl_->decoder, nullptr) == 0)
         failed = receive_frames(true) == FeedResult::Error;
 }
 void Media::pause(bool paused) {
+#ifdef WEBOS14_STARFISH
+    if (starfish_video()) impl_->starfish.pause(paused);
+#endif
     if (impl_->audio) SDL_PauseAudioDevice(impl_->audio, paused);
 }
 void Media::close() {
     auto &state = *impl_;
+#ifdef WEBOS14_STARFISH
+    state.starfish.close();
+#endif
 #ifdef WEBOS14_LGNC
     state.hardware.close();
 #endif
