@@ -49,6 +49,7 @@ private:
     bool retry_input(bool no_picture, int position);
     void recover_hardware(const Media &media, bool starfish, const char *reason);
     FeedResult feed_sample(Media &media, const Sample &sample);
+    void feed_split_audio(Media &media, AudioDecoder &decoder);
     bool enqueue(Sample sample);
     std::string profile_url_;
     std::string profile_media_;
@@ -69,6 +70,9 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable available_;
     std::deque<Sample> queue_;
+    std::deque<Sample> split_audio_queue_;
+    int64_t split_video_position_ = -1;
+    int64_t split_video_observed_at_ = 0;
     size_t queued_bytes_ = 0;
     std::atomic<bool> interrupted_{false};
     std::atomic<bool> finished_{false};

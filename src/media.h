@@ -26,6 +26,7 @@ public:
     bool hardware_enabled() const;
     bool hardware_video() const;
     bool starfish_video() const;
+    bool starfish_native_audio() const;
     bool starfish_end_error() const;
     bool starfish_enabled() const;
     int64_t display_position() const;

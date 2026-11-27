@@ -4,6 +4,7 @@
 #include <luna-service2/lunaservice.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -70,6 +71,15 @@ struct StarfishVideo::Impl {
     bool attempted = false;
     int width = 0, height = 0, audio_index = -1, channels = 0;
     int64_t timestamp_origin = -1;
+    struct FeedTrace {
+        int64_t pts;
+        int64_t relative;
+        size_t bytes;
+        bool video;
+    };
+    std::array<FeedTrace, 8> recent_feeds{};
+    size_t feed_cursor = 0;
+    bool failure_logged = false;
     std::string context;
     std::vector<uint8_t> adts;
     std::atomic<bool> load_ready{false}, failed{false}, ended{false};
@@ -272,7 +282,21 @@ bool StarfishVideo::open(const char *app_id, int width, int height, const Starfi
 
 void StarfishVideo::tick() {
     auto &state = *impl_;
-    if (!state.loaded || state.failed) return;
+    if (!state.loaded) return;
+    if (state.failed) {
+        if (!state.failure_logged) {
+            state.failure_logged = true;
+            const size_t first = state.feed_cursor > state.recent_feeds.size() ?
+                state.feed_cursor - state.recent_feeds.size() : 0;
+            for (size_t i = first; i < state.feed_cursor; ++i) {
+                const auto &feed = state.recent_feeds[i % state.recent_feeds.size()];
+                std::fprintf(stderr, "[starfish] recent %s pts=%lld us relative=%lld us bytes=%zu\n",
+                             feed.video ? "video" : "audio", static_cast<long long>(feed.pts / 1000),
+                             static_cast<long long>(feed.relative / 1000), feed.bytes);
+            }
+        }
+        return;
+    }
     state.dispatch();
     if (state.plane == Impl::Plane::Idle && state.load_ready) {
         const char *id = state.media_id(&state.storage);
@@ -313,13 +337,18 @@ FeedResult StarfishVideo::feed(const void *data, size_t size, int64_t pts, bool 
     if (!state.loaded || state.failed) return FeedResult::Error;
     if (state.timestamp_origin < 0) state.timestamp_origin = std::max(int64_t(0), pts);
     if (!video && !state.wrap_aac(data, size)) return FeedResult::Error;
+    const int64_t relative = std::max(int64_t(0), pts - state.timestamp_origin);
     char payload[240];
     std::snprintf(payload, sizeof(payload), "{\"bufferAddr\":\"%p\",\"bufferSize\":%zu,\"pts\":%lld,\"esData\":%d}",
-                  data, size, static_cast<long long>(std::max(int64_t(0), pts - state.timestamp_origin)), video ? 1 : 2);
+                  data, size, static_cast<long long>(relative), video ? 1 : 2);
     const auto reply = state.send_packet(&state.storage, payload);
     if (reply.find("BufferFull") != std::string::npos || reply.find("Pending") != std::string::npos)
         return FeedResult::Retry;
-    if (reply.find("Ok") != std::string::npos) return FeedResult::Accepted;
+    if (reply.find("Ok") != std::string::npos) {
+        state.recent_feeds[state.feed_cursor++ % state.recent_feeds.size()] =
+            Impl::FeedTrace{pts, relative, size, video};
+        return FeedResult::Accepted;
+    }
     std::fprintf(stderr, "[starfish] feed rejected: %s\n", reply.c_str());
     return FeedResult::Error;
 }
@@ -358,6 +387,8 @@ void StarfishVideo::close() {
     state.context.clear();
     state.audio_index = -1;
     state.timestamp_origin = -1;
+    state.feed_cursor = 0;
+    state.failure_logged = false;
     state.load_ready = state.failed = state.ended = false;
     state.stream_error = false;
     state.frames = 0;

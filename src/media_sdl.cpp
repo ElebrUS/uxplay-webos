@@ -51,6 +51,7 @@ struct Media::Impl {
 #endif
 #ifdef WEBOS14_STARFISH
     StarfishVideo starfish;
+    bool starfish_pcm = false;
 #endif
 
     bool starfish_video() const {
@@ -237,6 +238,15 @@ bool Media::open_clip(int width, int height, bool audio, const char *hardware_ap
         if (state.starfish.open(hardware_app_id, width, height, *starfish_stream)) {
             state.width = width;
             state.height = height;
+            state.starfish_pcm = audio && starfish_stream->audio_rate == 0;
+            if (state.starfish_pcm) {
+                state.open_audio(true, 44100);
+                if (!state.audio) {
+                    close();
+                    return false;
+                }
+                fprintf(stderr, "[starfish] experimental SDL audio active\n");
+            }
             ready = playing = true;
             return true;
         }
@@ -270,6 +280,13 @@ void Media::set_playback_clock(int64_t pts_ns) {
 }
 bool Media::hardware_video() const { return impl_->hardware_video(); }
 bool Media::starfish_video() const { return impl_->starfish_video(); }
+bool Media::starfish_native_audio() const {
+#ifdef WEBOS14_STARFISH
+    return starfish_video() && !impl_->starfish_pcm;
+#else
+    return false;
+#endif
+}
 bool Media::starfish_end_error() const {
 #ifdef WEBOS14_STARFISH
     return starfish_video() && impl_->starfish.rockhopper_end_error();
@@ -333,7 +350,8 @@ FeedResult Media::feed(const void *data, size_t size, int64_t pts_ns, bool video
     auto &state = *impl_;
     if (!ready || !data || size == 0 || size > INT_MAX) return FeedResult::Error;
 #ifdef WEBOS14_STARFISH
-    if (starfish_video()) return state.starfish.feed(data, size, pts_ns, video);
+    if (starfish_video() && (video || !state.starfish_pcm))
+        return state.starfish.feed(data, size, pts_ns, video);
 #endif
     if (!video) {
         if (!state.audio) return FeedResult::Accepted;
@@ -427,6 +445,7 @@ void Media::close() {
     auto &state = *impl_;
 #ifdef WEBOS14_STARFISH
     state.starfish.close();
+    state.starfish_pcm = false;
 #endif
 #ifdef WEBOS14_LGNC
     state.hardware.close();

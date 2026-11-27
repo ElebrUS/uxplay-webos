@@ -18,16 +18,21 @@ int main() {
     if (!app_id) app_id = "com.github.danlflh.uxplaywebos";
 #ifdef DIRECT_EXPERIMENT
     // Optional application-local configuration for a native LGNC test package.
-    const bool starfish_lab = std::ifstream(app_directory() + "/experimental-starfish.txt").good();
+    std::ifstream starfish_config(app_directory() + "/experimental-starfish.txt");
+    const bool starfish_lab = starfish_config.good();
+    std::string lab_audio;
+    const bool split_lab = starfish_lab && std::getline(starfish_config, lab_audio) && lab_audio == "sdl";
     std::string experimental_id;
     std::ifstream experimental(app_directory() + "/experimental-lgnc.txt");
     if (std::getline(experimental, experimental_id) && !experimental_id.empty() &&
         experimental_id.size() < 128 &&
         experimental_id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.") == std::string::npos) {
         app_id = experimental_id.c_str();
-        setenv("UXPLAY_NAME", starfish_lab ? "UxPlay Starfish Lab" : "UxPlay Hardware Lab", 1);
+        setenv("UXPLAY_NAME", split_lab ? "UxPlay Starfish SDL Lab" :
+               starfish_lab ? "UxPlay Starfish Lab" : "UxPlay Hardware Lab", 1);
     }
     if (starfish_lab) setenv("UXPLAY_STARFISH", "1", 1);
+    if (split_lab) setenv("UXPLAY_STARFISH_AUDIO", "sdl", 1);
 #endif
     Shell shell;if(!shell.open())return 1;
     shell.screen("Starting AirPlay receiver","");

@@ -307,11 +307,43 @@ void DirectClip::join(bool keep_input) {
     available_.notify_all();
     if (worker_.joinable()) worker_.join();
     if (!keep_input) close_input();
+    split_audio_queue_.clear();
+    split_video_position_ = -1;
+    split_video_observed_at_ = 0;
     std::lock_guard<std::mutex> lock(mutex_);
     queue_.clear();
     queued_bytes_ = 0;
     ready_ = false;
     duration_ms_ = position_ms_ = -1;
+}
+
+void DirectClip::feed_split_audio(Media &media, AudioDecoder &decoder) {
+    if (paused_ || rebuffering_) {
+        split_video_observed_at_ = 0;
+        return;
+    }
+    const int64_t displayed = media.display_position();
+    if (displayed < 0 || preview_at_ >= 0 || media.frames == 0) return;
+    const int64_t now = now_ns();
+    if (displayed != split_video_position_ || split_video_observed_at_ == 0) {
+        split_video_position_ = displayed;
+        split_video_observed_at_ = now;
+    }
+    // Rockhopper reports position periodically. Advance between reports but
+    // stop extending a stale position if the video pipeline stalls.
+    const int64_t video_clock = displayed +
+        std::min(now - split_video_observed_at_, 240 * ns_per_ms);
+    while (!split_audio_queue_.empty() &&
+           split_audio_queue_.front().pts <= video_clock + 15 * ns_per_ms) {
+        const auto &sample = split_audio_queue_.front();
+        std::vector<uint8_t> pcm;
+        if (sample.pts >= video_clock - 160 * ns_per_ms &&
+            decoder.decode(4, sample.data.data(), sample.data.size(), pcm) && !pcm.empty() &&
+            media.feed(pcm.data(), pcm.size(), sample.pts, false) == FeedResult::Accepted) {
+            ++audio_feeds_;
+        }
+        split_audio_queue_.pop_front();
+    }
 }
 
 void DirectClip::close_input() {
@@ -495,6 +527,9 @@ void DirectClip::read(double start, std::string source, bool forward_keyframe) {
         starfish_stream_.fps_den = frame_rate.den > 0 ? frame_rate.den : 1;
         starfish_stream_.audio_rate = audio_ ? audio_params->sample_rate : 0;
         starfish_stream_.audio_channels = audio_ ? audio_params->ch_layout.nb_channels : 0;
+        fprintf(stderr, "[direct] stream H264 profile=%d level=%d bitrate=%lld AAC profile=%d rate=%d channels=%d\n",
+                profile, video_params->level, static_cast<long long>(video_params->bit_rate),
+                audio_ ? audio_params->profile : -1, starfish_stream_.audio_rate, starfish_stream_.audio_channels);
         starfish_audio_supported_ = !audio_ || (audio_params->profile == AV_PROFILE_AAC_LOW &&
             starfish_stream_.audio_rate > 0 && starfish_stream_.audio_channels > 0 &&
             starfish_stream_.audio_channels <= 2);
@@ -778,11 +813,16 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
     }
     if (!playing_ && ready_) {
         const bool audio_ready = audio_ && decoder.configure_aac(audio_config_.data(), audio_config_.size());
-        const bool attempt_starfish = media.starfish_enabled() && !starfish_failed_ && starfish_audio_supported_;
+        const char *audio_mode = std::getenv("UXPLAY_STARFISH_AUDIO");
+        const bool split_audio = audio_ready && audio_mode && std::strcmp(audio_mode, "sdl") == 0;
+        const bool attempt_starfish = media.starfish_enabled() && !starfish_failed_ &&
+            (starfish_audio_supported_ || split_audio);
         const bool attempt_hardware = (media.hardware_enabled() || attempt_starfish) &&
             hardware_eligible_ && !hardware_failed_;
+        auto stream = starfish_stream_;
+        if (split_audio) stream.audio_rate = stream.audio_channels = 0;
         if (media.open_clip(width_, height_, audio_ready, attempt_hardware ? app_id : nullptr,
-                            attempt_starfish ? &starfish_stream_ : nullptr)) {
+                            attempt_starfish ? &stream : nullptr)) {
             if (attempt_hardware && !media.hardware_video()) {
                 hardware_failed_ = true;
                 fprintf(stderr, "[direct] LGNC unavailable, using software\n");
@@ -925,7 +965,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             sample = std::move(queue_.front());
             queue_.pop_front();
         }
-        const bool starfish_audio = media.starfish_video() && !sample.video &&
+        const bool starfish_audio = media.starfish_native_audio() && !sample.video &&
             (preview_at_ < 0 || sample.pts >= preview_at_);
         const int64_t submit_at = now_ns();
         if (sample.video && preview_at_ < 0) media.set_playback_clock(submit_at - origin_);
@@ -968,7 +1008,12 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
                     max_hardware_gap_ = max_hardware_lateness_ = 0;
                 }
             }
-        } else if (!media.starfish_video() && preview_at_ < 0 &&
+        } else if (media.starfish_video() && !media.starfish_native_audio()) {
+            if (preview_at_ < 0 || sample.pts >= preview_at_) {
+                if (split_audio_queue_.size() >= max_queue_packets) split_audio_queue_.pop_front();
+                split_audio_queue_.push_back(std::move(sample));
+            }
+        } else if (!media.starfish_native_audio() && preview_at_ < 0 &&
                    sample.pts >= now_ns() - origin_ - 160 * ns_per_ms) {
             std::vector<uint8_t> pcm;
             if (decoder.decode(4, sample.data.data(), sample.data.size(), pcm) && !pcm.empty()) {
@@ -1001,6 +1046,7 @@ bool DirectClip::tick(Media &media, AudioDecoder &decoder, Shell &shell, const c
             }
         }
     }
+    if (media.starfish_video() && !media.starfish_native_audio()) feed_split_audio(media, decoder);
     if (finished_ && empty) {
         if (media.starfish_video()) {
             const int64_t now = now_ns();
